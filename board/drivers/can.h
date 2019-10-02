@@ -51,6 +51,10 @@ int can2_tx_cnt = 0;
 void can_send(CAN_FIFOMailBox_TypeDef *to_push, uint8_t bus_number);
 bool can_pop(can_ring *q, CAN_FIFOMailBox_TypeDef *elem);
 
+//overrides
+CAN_FIFOMailBox_TypeDef brake_override;
+bool is_brake_override_valid = false;
+int brake_rolling_counter;
 
 // assign CAN numbering
 // bus num: Can bus number on ODB connector. Sent to/from USB
@@ -148,7 +152,7 @@ void can_init(uint8_t can_number) {
     CAN->sFilterRegister[2].FR1 = 0x170<<21;
     CAN->sFilterRegister[2].FR2 = 0x1E5<<21;
     CAN->sFilterRegister[3].FR1 = 0xC0<<21;
-    CAN->sFilterRegister[3].FR2 = 0xC0<21;
+    CAN->sFilterRegister[3].FR2 = 0x314<<21;
     CAN->sFilterRegister[14].FR1 = 0;
     CAN->sFilterRegister[14].FR2 = 0;
     CAN->FM1R |= CAN_FM1R_FBM0 | CAN_FM1R_FBM1 | CAN_FM1R_FBM2 | CAN_FM1R_FBM3;
@@ -359,22 +363,46 @@ void can_sce(CAN_TypeDef *CAN) {
   exit_critical_section();
 }
 
+void handle_update_brake_override(CAN_FIFOMailBox_TypeDef *override_msg) {
+  brake_override.RIR = (789 << 21) | (override_msg->RIR & 0x1FFFFFU);
+  brake_override.RDTR = override_msg->RDTR;
+  brake_override.RDLR = override_msg->RDLR;
+  brake_override.RDHR = override_msg->RDHR;
+
+  is_brake_override_valid = true;
+}
+
 // ***************************** CAN *****************************
 
 int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
   uint32_t addr = to_fwd->RIR>>21;
 
+  // CAR to ASCM
   if (bus_num == 0) {
+    // brake proxy
+    if (addr == 0x314) {
+      //puts("here\n");
+      handle_update_brake_override(to_fwd);
+      return -1;
+    }
     return 2;
   }
 
+  // ASCM to CAR
   if (bus_num == 2) {
-    // Drop all steering + brake messages
-    if ((addr == 384) || (addr == 715)  || (addr == 789) || (addr == 880)) {
-
-    // Drop all steering messages
-    //if ((addr == 384)) {
-        return -1;
+    // brake messages
+    if (addr == 789) {
+	if (is_brake_override_valid) {
+	  to_fwd->RIR = brake_override.RIR;
+          to_fwd->RDTR = brake_override.RDTR;
+          to_fwd->RDLR = brake_override.RDLR;
+          to_fwd->RDHR = brake_override.RDHR;
+	}
+	else {
+	  return -1;
+	}
+	is_brake_override_valid = false;
+	return 0;
     }
 
     return 0;
