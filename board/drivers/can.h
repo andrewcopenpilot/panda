@@ -401,7 +401,6 @@ void can_sce(CAN_TypeDef *CAN) {
 // ***************************** CAN *****************************
 
 void handle_update_steering_override(CAN_FIFOMailBox_TypeDef *override_msg) {
-    puts("handle steering\n");
     steering_override.RIR = (384 << 21) | (override_msg->RIR & 0x1FFFFFU);
     steering_override.RDTR = override_msg->RDTR;
     steering_override.RDLR = override_msg->RDLR;
@@ -453,6 +452,11 @@ int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
     // 383 == lkasteeringcmd proxy
     if (addr == 383) {
       handle_update_steering_override(to_fwd);
+      to_fwd->RIR = steering_override.RIR;
+      to_fwd->RDTR = steering_override.RDTR;
+      to_fwd->RDLR = steering_override.RDLR;
+      to_fwd->RDHR = steering_override.RDHR;
+      return 0;
       return -1;
     }
     // 714 == gasregencmd proxy
@@ -471,6 +475,7 @@ int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
   if (bus_num == 2) {
     // 384 == lkasteeringcmd
     if (addr == 384) {
+      return -1;
       if (is_steering_override_valid) {
         to_fwd->RIR = steering_override.RIR;
         to_fwd->RDTR = steering_override.RDTR;
@@ -478,6 +483,7 @@ int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
         to_fwd->RDHR = steering_override.RDHR; 
       }
       else {
+	puts("missed steering\n");
         return -1;
       }
       is_steering_override_valid = false;
@@ -494,9 +500,9 @@ int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
           to_fwd->RDHR = gas_regen_override.RDHR;
 	//}
       }
-      else {
-        return -1;
-      }
+      //else {
+      //  return -1;
+      //}
       is_gas_regen_override_valid = false;
       return 0;
     }
@@ -508,9 +514,9 @@ int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
         to_fwd->RDLR = acc_status_override.RDLR;
         to_fwd->RDHR = acc_status_override.RDHR;
       }
-      else {
-        return -1;
-      }
+      //else {
+      //  return -1;
+      //}
       is_acc_status_valid = false;
       return 0;
     }
