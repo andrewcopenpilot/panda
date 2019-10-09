@@ -372,6 +372,18 @@ void handle_update_brake_override(CAN_FIFOMailBox_TypeDef *override_msg) {
   is_brake_override_valid = true;
 }
 
+bool handle_update_brake_override_rolling_counter(uint32_t rolling_counter) {
+  uint32_t data = brake_override.RDLR & 0xFFFFU;
+  uint32_t dataswap = (data >> 8) | ((data << 8) & 0xFF00U);
+  uint32_t checksum = (0x10000U - dataswap - rolling_counter) & 0xFFFFU;
+  uint32_t checksumswap = (checksum >> 8) | ((checksum << 8) & 0xFF00U);
+  brake_override.RDLR &= 0x0000FFFFU;
+  brake_override.RDLR = brake_override.RDLR | (checksumswap << 16);
+  brake_override.RDHR &= ~0x3U;
+  brake_override.RDHR |= (rolling_counter & 0x3U);
+  return true;
+}
+
 // ***************************** CAN *****************************
 
 int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
@@ -380,8 +392,7 @@ int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
   // CAR to ASCM
   if (bus_num == 0) {
     // brake proxy
-    if (addr == 0x314) {
-      //puts("here\n");
+    if (addr == 788) {
       handle_update_brake_override(to_fwd);
       return -1;
     }
@@ -393,13 +404,13 @@ int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
     // brake messages
     if (addr == 789) {
 	if (is_brake_override_valid) {
-	  to_fwd->RIR = brake_override.RIR;
-          to_fwd->RDTR = brake_override.RDTR;
-          to_fwd->RDLR = brake_override.RDLR;
-          to_fwd->RDHR = brake_override.RDHR;
-	}
-	else {
-	  return -1;
+          uint32_t curr_rolling_counter = (to_fwd->RDHR & 0x3U);
+	  if (handle_update_brake_override_rolling_counter(curr_rolling_counter)) {
+	    to_fwd->RIR = brake_override.RIR;
+            to_fwd->RDTR = brake_override.RDTR;
+            to_fwd->RDLR = brake_override.RDLR;
+            to_fwd->RDHR = brake_override.RDHR;
+	  }
 	}
 	is_brake_override_valid = false;
 	return 0;
