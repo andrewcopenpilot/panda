@@ -154,6 +154,56 @@ void can_set_speed(uint8_t can_number) {
   }
 }
 
+void process_can(uint8_t can_number) {
+  if (can_number != 0xff) {
+
+    enter_critical_section();
+
+    CAN_TypeDef *CAN = CANIF_FROM_CAN_NUM(can_number);
+    uint8_t bus_number = BUS_NUM_FROM_CAN_NUM(can_number);
+
+    // check for empty mailbox
+    CAN_FIFOMailBox_TypeDef to_send;
+    if ((CAN->TSR & CAN_TSR_TME0) == CAN_TSR_TME0) {
+      // add successfully transmitted message to my fifo
+      if ((CAN->TSR & CAN_TSR_RQCP0) == CAN_TSR_RQCP0) {
+        if ((CAN->TSR & CAN_TSR_TERR0) == CAN_TSR_TERR0) {
+          #ifdef DEBUG
+            puts("CAN TX ERROR!\n");
+          #endif
+        }
+
+        if ((CAN->TSR & CAN_TSR_ALST0) == CAN_TSR_ALST0) {
+          #ifdef DEBUG
+            puts("CAN TX ARBITRATION LOST!\n");
+          #endif
+        }
+
+        // clear interrupt
+        // careful, this can also be cleared by requesting a transmission
+        CAN->TSR |= CAN_TSR_RQCP0;
+      }
+
+      if (can_pop(can_queues[bus_number], &to_send)) {
+        // only send if we have received a packet
+        CAN->sTxMailBox[0].TDLR = to_send.RDLR;
+        CAN->sTxMailBox[0].TDHR = to_send.RDHR;
+        CAN->sTxMailBox[0].TDTR = to_send.RDTR;
+        CAN->sTxMailBox[0].TIR = to_send.RIR;
+
+	if (can_number == 0) {
+          can0_tx_cnt++;
+        }
+        if (can_number == 2) {
+          can2_tx_cnt++;
+        }
+      }
+    }
+
+    exit_critical_section();
+  }
+}
+
 void can_init(uint8_t can_number) {
   if (can_number == 0xff) return;
 
@@ -227,7 +277,7 @@ void can_init(uint8_t can_number) {
   }
 
   // in case there are queued up messages
-  //process_can(can_number);
+  process_can(can_number);
 }
 
 int can_overflow_cnt = 0;
@@ -271,55 +321,6 @@ int can_push(can_ring *q, CAN_FIFOMailBox_TypeDef *elem) {
   return ret;
 }
 
-void process_can(uint8_t can_number) {
-  if (can_number != 0xff) {
-
-    enter_critical_section();
-
-    CAN_TypeDef *CAN = CANIF_FROM_CAN_NUM(can_number);
-    uint8_t bus_number = BUS_NUM_FROM_CAN_NUM(can_number);
-
-    // check for empty mailbox
-    CAN_FIFOMailBox_TypeDef to_send;
-    if ((CAN->TSR & CAN_TSR_TME0) == CAN_TSR_TME0) {
-      // add successfully transmitted message to my fifo
-      if ((CAN->TSR & CAN_TSR_RQCP0) == CAN_TSR_RQCP0) {
-        if ((CAN->TSR & CAN_TSR_TERR0) == CAN_TSR_TERR0) {
-          #ifdef DEBUG
-            puts("CAN TX ERROR!\n");
-          #endif
-        }
-
-        if ((CAN->TSR & CAN_TSR_ALST0) == CAN_TSR_ALST0) {
-          #ifdef DEBUG
-            puts("CAN TX ARBITRATION LOST!\n");
-          #endif
-        }
-
-        // clear interrupt
-        // careful, this can also be cleared by requesting a transmission
-        CAN->TSR |= CAN_TSR_RQCP0;
-      }
-
-      if (can_pop(can_queues[bus_number], &to_send)) {
-        // only send if we have received a packet
-        CAN->sTxMailBox[0].TDLR = to_send.RDLR;
-        CAN->sTxMailBox[0].TDHR = to_send.RDHR;
-        CAN->sTxMailBox[0].TDTR = to_send.RDTR;
-        CAN->sTxMailBox[0].TIR = to_send.RIR;
-
-	if (can_number == 0) {
-          can0_tx_cnt++;
-        }
-        if (can_number == 2) {
-          can2_tx_cnt++;
-        }
-      }
-    }
-
-    exit_critical_section();
-  }
-}
 
 void can_init_all() {
   for (int i=0; i < CAN_MAX; i++) {
@@ -418,6 +419,27 @@ void handle_update_gasregencmd_override(CAN_FIFOMailBox_TypeDef *override_msg) {
     is_gas_regen_override_valid = true;
 }
 
+
+bool handle_update_gasregencmd_override_rolling_counter(uint32_t rolling_counter) {
+  gas_regen_override.RDLR &= 0xFFFFFF3FU;
+  gas_regen_override.RDLR |= (rolling_counter << 6);
+  uint32_t checksum3 = (0x100U - ((gas_regen_override.RDLR & 0xFF000000U) >> 24) - rolling_counter) & 0xFFU;
+
+  gas_regen_override.RDHR &= 0x00FFFFFFU;
+  gas_regen_override.RDHR = gas_regen_override.RDHR | (checksum3 << 24);
+
+  // GAS/REGEN: safety check - TODO disable system instead of just dropping out of saftey range messages
+  //int gas_regen = ((GET_BYTE(&gas_regen_override, 2) & 0x7FU) << 5) + ((GET_BYTE(&gas_regen_override, 3) & 0xF8U) >> 3);
+  //bool apply = GET_BYTE(&gas_regen_override, 0) & 1U;
+  //if (apply || (gas_regen != GM_MAX_REGEN)) {
+  //  return false;
+  //}
+  //if (gas_regen > GM_MAX_GAS) {
+  //  return false;
+  //}
+  return true;
+}
+
 void handle_update_acc_status_override(CAN_FIFOMailBox_TypeDef *override_msg) {
   acc_status_override.RIR = (880 << 21) | (override_msg->RIR & 0x1FFFFFU);
   acc_status_override.RDTR = override_msg->RDTR;
@@ -425,23 +447,6 @@ void handle_update_acc_status_override(CAN_FIFOMailBox_TypeDef *override_msg) {
   acc_status_override.RDHR = override_msg->RDHR;
 
   is_acc_status_valid = true;
-}
-
-bool handle_update_gasregencmd_override_rolling_counter(int rolling_counter) {
-  gas_regen_override.RDLR = gas_regen_override.RDLR | ((rolling_counter << 6) & 0xFFFFFF3FU);
-  int checksum3 = (0x100U - ((gas_regen_override.RDLR & 0xFF000000U) >> 24) - rolling_counter) & 0xFFU;
-  gas_regen_override.RDHR = gas_regen_override.RDHR | ((checksum3 << 24) & 0xFF000000U);
-
-  // GAS/REGEN: safety check - TODO disable system instead of just dropping out of saftey range messages
-  int gas_regen = ((GET_BYTE(&gas_regen_override, 2) & 0x7FU) << 5) + ((GET_BYTE(&gas_regen_override, 3) & 0xF8U) >> 3);
-  bool apply = GET_BYTE(&gas_regen_override, 0) & 1U;
-  if (apply || (gas_regen != GM_MAX_REGEN)) {
-    return false;
-  }
-  if (gas_regen > GM_MAX_GAS) {
-    return false;
-  }
-  return true;
 }
 
 int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
@@ -492,13 +497,13 @@ int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
     // 715 == gasregencmd
     if (addr == 715) {
       if (is_gas_regen_override_valid) {
-	//int curr_rolling_counter = (to_fwd->RDLR & 0xC0U) >> 6;
-	//if (handle_update_gasregencmd_override_rolling_counter(curr_rolling_counter)) {
+	uint32_t curr_rolling_counter = (to_fwd->RDLR & 0xC0U) >> 6;
+	if (handle_update_gasregencmd_override_rolling_counter(curr_rolling_counter)) {
           to_fwd->RIR = gas_regen_override.RIR;
           to_fwd->RDTR = gas_regen_override.RDTR;
           to_fwd->RDLR = gas_regen_override.RDLR;
           to_fwd->RDHR = gas_regen_override.RDHR;
-	//}
+	}
       }
       //else {
       //  return -1;
