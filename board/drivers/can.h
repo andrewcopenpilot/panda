@@ -69,15 +69,15 @@ bool can_pop(can_ring *q, CAN_FIFOMailBox_TypeDef *elem);
 
 // overrides
 CAN_FIFOMailBox_TypeDef steering_override;
-bool is_steering_override_valid = false;
+volatile int steering_override_ttl = 0;
 int steering_rolling_counter;
 
 CAN_FIFOMailBox_TypeDef gas_regen_override;
-bool is_gas_regen_override_valid = false;
+volatile int gas_regen_override_ttl = 0;
 int gas_regen_counter;
 
 CAN_FIFOMailBox_TypeDef acc_status_override;
-bool is_acc_status_valid;
+volatile int acc_status_ttl = 0;
 
 // assign CAN numbering
 // bus num: Can bus number on ODB connector. Sent to/from USB
@@ -205,6 +205,82 @@ void process_can(uint8_t can_number) {
 }
 
 void can_init(uint8_t can_number) {
+  if (can_number == 0xff) return;
+
+  CAN_TypeDef *CAN = CANIF_FROM_CAN_NUM(can_number);
+  set_can_enable(CAN, 1);
+  can_set_speed(can_number);
+
+  // accept all filter
+  CAN->FMR |= CAN_FMR_FINIT;
+
+  // no mask
+  CAN->FS1R|=CAN_FS1R_FSC0;
+
+  if (can_number == 99) {
+    CAN->sFilterRegister[0].FR1 = 0x24B<<21;
+    CAN->sFilterRegister[0].FR2 = 0xF1<<21;
+    CAN->sFilterRegister[1].FR1 = 0xC9<<21;
+    CAN->sFilterRegister[1].FR2 = 0x1E9<<21;
+    CAN->sFilterRegister[2].FR1 = 0x1C4<<21;
+    CAN->sFilterRegister[2].FR2 = 0x1C5<<21;
+    CAN->sFilterRegister[3].FR1 = 0x1F5<<21;
+    CAN->sFilterRegister[3].FR2 = 0x1E1<<21;
+    CAN->sFilterRegister[4].FR1 = 0x214<<21;
+    CAN->sFilterRegister[4].FR2 = 0x230<<21;
+    CAN->sFilterRegister[5].FR1 = 0x34A<<21;
+    CAN->sFilterRegister[5].FR2 = 0x12A<<21;
+    CAN->sFilterRegister[6].FR1 = 0x135<<21;
+    CAN->sFilterRegister[6].FR2 = 0x184<<21;
+    CAN->sFilterRegister[7].FR1 = 0x1F1<<21;
+    CAN->sFilterRegister[7].FR2 = 0x140<<21;
+    CAN->sFilterRegister[8].FR1 = 0x2CA<<21;
+    CAN->sFilterRegister[8].FR2 = 0x17F<<21;
+    CAN->sFilterRegister[9].FR1 = 0x36F<<21;
+    CAN->sFilterRegister[9].FR1 = 0x36F<<21;
+    CAN->sFilterRegister[14].FR1 = 0;
+    CAN->sFilterRegister[14].FR2 = 0;
+    CAN->FM1R |= CAN_FM1R_FBM0 | CAN_FM1R_FBM1 | CAN_FM1R_FBM2 | CAN_FM1R_FBM3 | CAN_FM1R_FBM4 | CAN_FM1R_FBM5 | CAN_FM1R_FBM6 | CAN_FM1R_FBM7 | CAN_FM1R_FBM8 | CAN_FM1R_FBM9; 
+    CAN->FA1R |= CAN_FA1R_FACT0 | CAN_FA1R_FACT1 | CAN_FA1R_FACT2 | CAN_FA1R_FACT3 | CAN_FA1R_FACT4 | CAN_FA1R_FACT5 | CAN_FA1R_FACT6 | CAN_FA1R_FACT7 | CAN_FA1R_FACT8 | CAN_FA1R_FACT9;
+    CAN->FA1R |= (1 << 14);
+    CAN->FFA1R = 0x00000000;
+  }
+  else {
+    CAN->sFilterRegister[0].FR1 = 0;
+    CAN->sFilterRegister[0].FR2 = 0;
+    CAN->sFilterRegister[14].FR1 = 0;
+    CAN->sFilterRegister[14].FR2 = 0;
+    CAN->FA1R |= 1 | (1 << 14);
+  }
+
+  CAN->FMR &= ~(CAN_FMR_FINIT);
+
+  // enable certain CAN interrupts
+  CAN->IER |= CAN_IER_TMEIE | CAN_IER_FMPIE0;
+  //NVIC_EnableIRQ(CAN_IER_TMEIE);
+  switch (can_number) {
+    case 0:
+      NVIC_EnableIRQ(CAN1_TX_IRQn);
+      NVIC_EnableIRQ(CAN1_RX0_IRQn);
+      NVIC_EnableIRQ(CAN1_SCE_IRQn);
+      break;
+    case 1:
+      NVIC_EnableIRQ(CAN2_TX_IRQn);
+      NVIC_EnableIRQ(CAN2_RX0_IRQn);
+      NVIC_EnableIRQ(CAN2_SCE_IRQn);
+      break;
+    case 2:
+      NVIC_EnableIRQ(CAN3_TX_IRQn);
+      NVIC_EnableIRQ(CAN3_RX0_IRQn);
+      NVIC_EnableIRQ(CAN3_SCE_IRQn);
+      break;
+  }
+
+  // in case there are queued up messages
+  process_can(can_number);
+}
+
+void can_init_hw(uint8_t can_number) {
   if (can_number == 0xff) return;
 
   CAN_TypeDef *CAN = CANIF_FROM_CAN_NUM(can_number);
@@ -399,6 +475,34 @@ void can_sce(CAN_TypeDef *CAN) {
   exit_critical_section();
 }
 
+void ttl_timer_init() {
+  TIM3->PSC = 4800-1;	        // Set prescaler to 24 000 (PSC + 1)
+  TIM3->ARR = 1000;	          // Auto reload value 1000
+  TIM3->DIER = TIM_DIER_UIE; // Enable update interrupt (timer level)
+  TIM3->CR1 = TIM_CR1_CEN;   // Enable timer
+
+  NVIC_EnableIRQ(TIM3_IRQn);
+}
+
+void TIM3_IRQHandler(void)
+{
+if (TIM3->SR & TIM_SR_UIF) // if UIF flag is set
+  {
+    TIM3->SR &= ~TIM_SR_UIF; // clear UIF flag
+    enter_critical_section();
+    if (steering_override_ttl > 0) {
+      steering_override_ttl--;
+    }
+    if (gas_regen_override_ttl > 0) {
+      gas_regen_override_ttl--;
+    }
+    if (acc_status_ttl > 0) {
+      acc_status_ttl--;
+    }
+    exit_critical_section();
+  }
+}
+
 // ***************************** CAN *****************************
 
 void handle_update_steering_override(CAN_FIFOMailBox_TypeDef *override_msg) {
@@ -407,7 +511,7 @@ void handle_update_steering_override(CAN_FIFOMailBox_TypeDef *override_msg) {
     steering_override.RDLR = override_msg->RDLR;
     steering_override.RDHR = override_msg->RDHR;
 
-    is_steering_override_valid = true;
+    steering_override_ttl = 2;
 }
 
 void handle_update_gasregencmd_override(CAN_FIFOMailBox_TypeDef *override_msg) {
@@ -416,7 +520,7 @@ void handle_update_gasregencmd_override(CAN_FIFOMailBox_TypeDef *override_msg) {
     gas_regen_override.RDLR = override_msg->RDLR;
     gas_regen_override.RDHR = override_msg->RDHR;
 
-    is_gas_regen_override_valid = true;
+    gas_regen_override_ttl = 2;
 }
 
 
@@ -446,7 +550,7 @@ void handle_update_acc_status_override(CAN_FIFOMailBox_TypeDef *override_msg) {
   acc_status_override.RDLR = override_msg->RDLR;
   acc_status_override.RDHR = override_msg->RDHR;
 
-  is_acc_status_valid = true;
+  acc_status_ttl = 2;
 }
 
 int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
@@ -455,15 +559,14 @@ int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
   // CAR to ASCM
   if (bus_num == 0) {
     // 383 == lkasteeringcmd proxy
-    if (addr == 383) {
-      handle_update_steering_override(to_fwd);
-      to_fwd->RIR = steering_override.RIR;
-      to_fwd->RDTR = steering_override.RDTR;
-      to_fwd->RDLR = steering_override.RDLR;
-      to_fwd->RDHR = steering_override.RDHR;
-      return 0;
-      return -1;
-    }
+    //if (addr == 383) {
+    //  handle_update_steering_override(to_fwd);
+    //  to_fwd->RIR = steering_override.RIR;
+    //  to_fwd->RDTR = steering_override.RDTR;
+    //  to_fwd->RDLR = steering_override.RDLR;
+    //  to_fwd->RDHR = steering_override.RDHR;
+    //  return 0;
+    //}
     // 714 == gasregencmd proxy
     if (addr == 714) {
       handle_update_gasregencmd_override(to_fwd);
@@ -481,22 +584,21 @@ int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
     // 384 == lkasteeringcmd
     if (addr == 384) {
       return -1;
-      if (is_steering_override_valid) {
-        to_fwd->RIR = steering_override.RIR;
-        to_fwd->RDTR = steering_override.RDTR;
-        to_fwd->RDLR = steering_override.RDLR;
-        to_fwd->RDHR = steering_override.RDHR; 
-      }
-      else {
-	puts("missed steering\n");
-        return -1;
-      }
-      is_steering_override_valid = false;
-      return 0;
+      //if (steering_override_ttl > 0) {
+      //  to_fwd->RIR = steering_override.RIR;
+      //  to_fwd->RDTR = steering_override.RDTR;
+      //  to_fwd->RDLR = steering_override.RDLR;
+      //  to_fwd->RDHR = steering_override.RDHR; 
+      //}
+      //else {
+	//puts("missed steering\n");
+      //  return -1;
+      //}
+      //return 0;
     }
     // 715 == gasregencmd
     if (addr == 715) {
-      if (is_gas_regen_override_valid) {
+      if (gas_regen_override_ttl > 0) {
 	uint32_t curr_rolling_counter = (to_fwd->RDLR & 0xC0U) >> 6;
 	if (handle_update_gasregencmd_override_rolling_counter(curr_rolling_counter)) {
           to_fwd->RIR = gas_regen_override.RIR;
@@ -508,12 +610,11 @@ int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
       //else {
       //  return -1;
       //}
-      is_gas_regen_override_valid = false;
       return 0;
     }
     // 880 == ASCMActiveCruiseControlStatus
     if (addr == 880) {
-      if (is_acc_status_valid) {
+      if (acc_status_ttl > 0) {
         to_fwd->RIR = acc_status_override.RIR;
         to_fwd->RDTR = acc_status_override.RDTR;
         to_fwd->RDLR = acc_status_override.RDLR;
@@ -522,7 +623,6 @@ int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
       //else {
       //  return -1;
       //}
-      is_acc_status_valid = false;
       return 0;
     }
 

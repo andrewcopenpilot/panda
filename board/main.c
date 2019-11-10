@@ -196,20 +196,25 @@ int main() {
   TIM2->EGR = TIM_EGR_UG;
   // use TIM2->CNT to read
 
+  
   // enable USB
   usb_init();
 
   set_esp_mode(ESP_DISABLED);
   can_set_gmlan(1);
 
-  delay(10000000);
+  //delay(20000000);
   can_init_all();
+  delay(10000000);
+  can_init_hw(0);
 
   adc_init();
 
   puts("**** INTERRUPTS ON ****\n");
 
   __enable_irq();
+
+  ttl_timer_init();
 
   // if the error interrupt is enabled to quickly when the CAN bus is active
   // something bad happens and you can't connect to the device over USB
