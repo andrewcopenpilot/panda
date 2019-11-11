@@ -52,7 +52,7 @@ const int GM_MAX_RATE_UP = 7;
 const int GM_MAX_RATE_DOWN = 17;
 const int GM_DRIVER_TORQUE_ALLOWANCE = 50;
 const int GM_DRIVER_TORQUE_FACTOR = 4;
-const int GM_MAX_GAS = 3072;
+const int GM_MAX_GAS = 3500;
 const int GM_MAX_REGEN = 1404;
 const int GM_MAX_BRAKE = 350;
 
@@ -533,14 +533,14 @@ bool handle_update_gasregencmd_override_rolling_counter(uint32_t rolling_counter
   gas_regen_override.RDHR = gas_regen_override.RDHR | (checksum3 << 24);
 
   // GAS/REGEN: safety check - TODO disable system instead of just dropping out of saftey range messages
-  //int gas_regen = ((GET_BYTE(&gas_regen_override, 2) & 0x7FU) << 5) + ((GET_BYTE(&gas_regen_override, 3) & 0xF8U) >> 3);
-  //bool apply = GET_BYTE(&gas_regen_override, 0) & 1U;
-  //if (apply || (gas_regen != GM_MAX_REGEN)) {
-  //  return false;
-  //}
-  //if (gas_regen > GM_MAX_GAS) {
-  //  return false;
-  //}
+  int gas_regen = ((GET_BYTE(&gas_regen_override, 2) & 0x7FU) << 5) + ((GET_BYTE(&gas_regen_override, 3) & 0xF8U) >> 3);
+  bool apply = GET_BYTE(&gas_regen_override, 0) & 1U;
+  if (apply || (gas_regen != GM_MAX_REGEN)) {
+    return false;
+  }
+  if (gas_regen > GM_MAX_GAS) {
+    return false;
+  }
   return true;
 }
 
@@ -558,15 +558,7 @@ int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
   
   // CAR to ASCM
   if (bus_num == 0) {
-    // 383 == lkasteeringcmd proxy
-    //if (addr == 383) {
-    //  handle_update_steering_override(to_fwd);
-    //  to_fwd->RIR = steering_override.RIR;
-    //  to_fwd->RDTR = steering_override.RDTR;
-    //  to_fwd->RDLR = steering_override.RDLR;
-    //  to_fwd->RDHR = steering_override.RDHR;
-    //  return 0;
-    //}
+    // 383 == lkasteeringcmd proxy : Unused for now
     // 714 == gasregencmd proxy
     if (addr == 714) {
       handle_update_gasregencmd_override(to_fwd);
@@ -581,20 +573,9 @@ int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
 
   // ASCM to CAR
   if (bus_num == 2) {
-    // 384 == lkasteeringcmd
+    // 384 == lkasteeringcmd : Silance OEM system at all times because it sucks and doesn't cause a dash error
     if (addr == 384) {
       return -1;
-      //if (steering_override_ttl > 0) {
-      //  to_fwd->RIR = steering_override.RIR;
-      //  to_fwd->RDTR = steering_override.RDTR;
-      //  to_fwd->RDLR = steering_override.RDLR;
-      //  to_fwd->RDHR = steering_override.RDHR; 
-      //}
-      //else {
-	//puts("missed steering\n");
-      //  return -1;
-      //}
-      //return 0;
     }
     // 715 == gasregencmd
     if (addr == 715) {
@@ -607,9 +588,6 @@ int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
           to_fwd->RDHR = gas_regen_override.RDHR;
 	}
       }
-      //else {
-      //  return -1;
-      //}
       return 0;
     }
     // 880 == ASCMActiveCruiseControlStatus
@@ -620,9 +598,6 @@ int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
         to_fwd->RDLR = acc_status_override.RDLR;
         to_fwd->RDHR = acc_status_override.RDHR;
       }
-      //else {
-      //  return -1;
-      //}
       return 0;
     }
 
