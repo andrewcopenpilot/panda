@@ -26,6 +26,9 @@ chassis: 0x1e5: steering angle sensor
 chassis: 0xc0: seems to be needed for auto highbeams
 */
 
+#define GET_ADDR(msg) ((((msg)->RIR & 4) != 0) ? ((msg)->RIR >> 3) : ((msg)->RIR >> 21))
+#define GET_BYTE(msg, b) (((int)(b) > 3) ? (((msg)->RDHR >> (8U * ((unsigned int)(b) % 4U))) & 0XFFU) : (((msg)->RDLR >> (8U * (unsigned int)(b))) & 0xFFU))
+
 // IRQs: CAN1_TX, CAN1_RX0, CAN1_SCE, CAN2_TX, CAN2_RX0, CAN2_SCE, CAN3_TX, CAN3_RX0, CAN3_SCE
 
 #define CAN_MAX 3
@@ -40,6 +43,8 @@ can_buffer(tx3_q, 0x100)
 can_buffer(txgmlan_q, 0x100)
 can_ring *can_queues[] = {&can_tx1_q, &can_tx2_q, &can_tx3_q, &can_txgmlan_q};
 
+const int GM_MAX_BRAKE = 350;
+
 int can_err_cnt = 0;
 int can0_mailbox_full_cnt = 0;
 int can1_mailbox_full_cnt = 0;
@@ -48,12 +53,15 @@ int can2_rx_cnt = 0;
 int can0_tx_cnt = 0;
 int can2_tx_cnt = 0;
 
+uint32_t tick = 0;
+
 void can_send(CAN_FIFOMailBox_TypeDef *to_push, uint8_t bus_number);
 bool can_pop(can_ring *q, CAN_FIFOMailBox_TypeDef *elem);
+void send_interceptor_status();
 
 //overrides
 CAN_FIFOMailBox_TypeDef brake_override;
-bool is_brake_override_valid = false;
+volatile int brake_override_ttl = 0;
 int brake_rolling_counter;
 
 // assign CAN numbering
@@ -363,13 +371,51 @@ void can_sce(CAN_TypeDef *CAN) {
   exit_critical_section();
 }
 
+void ttl_timer_init() {
+  TIM3->PSC = 4800-1;           // Set prescaler to 24 000 (PSC + 1)
+  TIM3->ARR = 1000;               // Auto reload value 1000
+  TIM3->DIER = TIM_DIER_UIE; // Enable update interrupt (timer level)
+  TIM3->CR1 = TIM_CR1_CEN;   // Enable timer
+
+  NVIC_EnableIRQ(TIM3_IRQn);
+}
+
+void TIM3_IRQHandler(void) {
+  if (TIM3->SR & TIM_SR_UIF) { // if UIF flag is set
+    TIM3->SR &= ~TIM_SR_UIF; // clear UIF flag
+    enter_critical_section();
+    if (brake_override_ttl > 0) {
+      brake_override_ttl--;
+    }
+    exit_critical_section();
+    
+    tick++;
+    if (tick % 1 == 0) {
+        send_interceptor_status();
+    }
+
+  }
+}
+
+void send_interceptor_status() {
+    CAN_FIFOMailBox_TypeDef status;
+
+    status.RIR = (885 << 21) | 1;
+    status.RDTR = 2;
+    status.RDLR = 0x01020304;
+    status.RDHR = 0x05060708;
+
+    can_push(can_queues[0], &status);
+    process_can(CAN_NUM_FROM_BUS_NUM(0));
+}
+
 void handle_update_brake_override(CAN_FIFOMailBox_TypeDef *override_msg) {
   brake_override.RIR = (789 << 21) | (override_msg->RIR & 0x1FFFFFU);
   brake_override.RDTR = override_msg->RDTR;
   brake_override.RDLR = override_msg->RDLR;
   brake_override.RDHR = override_msg->RDHR;
 
-  is_brake_override_valid = true;
+  brake_override_ttl = 5;
 }
 
 bool handle_update_brake_override_rolling_counter(uint32_t rolling_counter) {
@@ -381,6 +427,13 @@ bool handle_update_brake_override_rolling_counter(uint32_t rolling_counter) {
   brake_override.RDLR = brake_override.RDLR | (checksumswap << 16);
   brake_override.RDHR &= ~0x3U;
   brake_override.RDHR |= (rolling_counter & 0x3U);
+
+  // BRAKE: safety check
+  int brake = ((GET_BYTE(&brake_override, 0) & 0xFU) << 8) + GET_BYTE(&brake_override, 1);
+  brake = (0x1000 - brake) & 0xFFF;
+  if (brake > GM_MAX_BRAKE) {
+    return false;
+  }
   return true;
 }
 
@@ -403,7 +456,7 @@ int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
   if (bus_num == 2) {
     // brake messages
     if (addr == 789) {
-	if (is_brake_override_valid) {
+	if (brake_override_ttl > 0) {
           uint32_t curr_rolling_counter = (to_fwd->RDHR & 0x3U);
 	  if (handle_update_brake_override_rolling_counter(curr_rolling_counter)) {
 	    to_fwd->RIR = brake_override.RIR;
@@ -412,10 +465,8 @@ int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
             to_fwd->RDHR = brake_override.RDHR;
 	  }
 	}
-	is_brake_override_valid = false;
 	return 0;
     }
-
     return 0;
   }
 

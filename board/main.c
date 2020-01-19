@@ -209,6 +209,8 @@ int main() {
 
   __enable_irq();
 
+  ttl_timer_init();
+
   // if the error interrupt is enabled to quickly when the CAN bus is active
   // something bad happens and you can't connect to the device over USB
   delay(10000000);
