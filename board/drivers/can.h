@@ -52,9 +52,8 @@ const int GM_MAX_RATE_UP = 7;
 const int GM_MAX_RATE_DOWN = 17;
 const int GM_DRIVER_TORQUE_ALLOWANCE = 50;
 const int GM_DRIVER_TORQUE_FACTOR = 4;
-const int GM_MAX_GAS = 3500;
+const int GM_MAX_GAS = 4500;
 const int GM_MAX_REGEN = 1404;
-const int GM_MAX_BRAKE = 350;
 
 int can_err_cnt = 0;
 int can0_mailbox_full_cnt = 0;
@@ -64,8 +63,13 @@ int can2_rx_cnt = 0;
 int can0_tx_cnt = 0;
 int can2_tx_cnt = 0;
 
+uint32_t tick = 0;
+uint8_t ascm_acc_cmd_active = 0;
+
 void can_send(CAN_FIFOMailBox_TypeDef *to_push, uint8_t bus_number);
 bool can_pop(can_ring *q, CAN_FIFOMailBox_TypeDef *elem);
+void send_interceptor_status();
+
 
 // overrides
 CAN_FIFOMailBox_TypeDef steering_override;
@@ -78,6 +82,7 @@ int gas_regen_counter;
 
 CAN_FIFOMailBox_TypeDef acc_status_override;
 volatile int acc_status_ttl = 0;
+
 
 // assign CAN numbering
 // bus num: Can bus number on ODB connector. Sent to/from USB
@@ -491,19 +496,41 @@ if (TIM3->SR & TIM_SR_UIF) // if UIF flag is set
     TIM3->SR &= ~TIM_SR_UIF; // clear UIF flag
     enter_critical_section();
     if (steering_override_ttl > 0) {
-      steering_override_ttl--;
+        steering_override_ttl--;
     }
     if (gas_regen_override_ttl > 0) {
-      gas_regen_override_ttl--;
+        gas_regen_override_ttl--;
     }
     if (acc_status_ttl > 0) {
-      acc_status_ttl--;
+        acc_status_ttl--;
     }
     exit_critical_section();
+
+    tick++;
+    if (tick % 1 == 0) {
+        send_interceptor_status();
+    }
   }
 }
 
 // ***************************** CAN *****************************
+
+int RESUME_MSG[4] = {0xBF2C00, 0xEE2101, 0xDD2602, 0xCC2B03};
+int UNPRESS_MSG[4] = {0xFF1000, 0xEE1501, 0xDD1A02, 0xCC1F03};
+int CRUISE_MAIN_MSG[4] = {0xBF5000, 0xAE5501, 0x9D5A02, 0x8C5F03};
+
+void send_interceptor_status() {
+    CAN_FIFOMailBox_TypeDef status;
+
+    status.RIR = (885 << 21) | 1;
+    status.RDTR = 8;
+    status.RDLR = 0;
+    status.RDLR |= ascm_acc_cmd_active;
+    status.RDHR = 0x05060708;
+
+    can_push(can_queues[0], &status);
+    process_can(CAN_NUM_FROM_BUS_NUM(0));
+}	
 
 void handle_update_steering_override(CAN_FIFOMailBox_TypeDef *override_msg) {
     steering_override.RIR = (384 << 21) | (override_msg->RIR & 0x1FFFFFU);
@@ -511,7 +538,7 @@ void handle_update_steering_override(CAN_FIFOMailBox_TypeDef *override_msg) {
     steering_override.RDLR = override_msg->RDLR;
     steering_override.RDHR = override_msg->RDHR;
 
-    steering_override_ttl = 2;
+    steering_override_ttl = 5;
 }
 
 void handle_update_gasregencmd_override(CAN_FIFOMailBox_TypeDef *override_msg) {
@@ -520,7 +547,7 @@ void handle_update_gasregencmd_override(CAN_FIFOMailBox_TypeDef *override_msg) {
     gas_regen_override.RDLR = override_msg->RDLR;
     gas_regen_override.RDHR = override_msg->RDHR;
 
-    gas_regen_override_ttl = 2;
+    gas_regen_override_ttl = 5;
 }
 
 
@@ -534,10 +561,10 @@ bool handle_update_gasregencmd_override_rolling_counter(uint32_t rolling_counter
 
   // GAS/REGEN: safety check - TODO disable system instead of just dropping out of saftey range messages
   int gas_regen = ((GET_BYTE(&gas_regen_override, 2) & 0x7FU) << 5) + ((GET_BYTE(&gas_regen_override, 3) & 0xF8U) >> 3);
-  bool apply = GET_BYTE(&gas_regen_override, 0) & 1U;
-  if (apply || (gas_regen != GM_MAX_REGEN)) {
-    return false;
-  }
+  //bool apply = GET_BYTE(&gas_regen_override, 0) & 1U;
+  //if (apply || (gas_regen != GM_MAX_REGEN)) {
+  //  return false;
+  //}
   if (gas_regen > GM_MAX_GAS) {
     return false;
   }
@@ -550,7 +577,7 @@ void handle_update_acc_status_override(CAN_FIFOMailBox_TypeDef *override_msg) {
   acc_status_override.RDLR = override_msg->RDLR;
   acc_status_override.RDHR = override_msg->RDHR;
 
-  acc_status_ttl = 2;
+  acc_status_ttl = 5;
 }
 
 int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
@@ -567,7 +594,13 @@ int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
     // 879 == ASCMActiveCruiseControlStatus proxy
     if (addr == 879) {
       handle_update_acc_status_override(to_fwd);
+      return -1;
     }
+    // BCM Button
+    //if (addr == 481) {
+      //uint8_t button_message_counter = to_fwd->RDHR & 0x000003;
+      //to_fwd->RDHR = UNPRESS_MSG[button_message_counter];
+    //}
     return 2;
   }
 
@@ -592,6 +625,7 @@ int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
     }
     // 880 == ASCMActiveCruiseControlStatus
     if (addr == 880) {
+      ascm_acc_cmd_active = (to_fwd->RDLR >> 23) & 1U;
       if (acc_status_ttl > 0) {
         to_fwd->RIR = acc_status_override.RIR;
         to_fwd->RDTR = acc_status_override.RDTR;
