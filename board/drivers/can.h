@@ -28,6 +28,18 @@ chassis: 0xC0: Seems to be needed for auto highbeams
 powertrain proxy 0x2CA gas regen proxy
 */
 
+#define MIN(a,b) \
+ ({ __typeof__ (a) _a = (a); \
+     __typeof__ (b) _b = (b); \
+   (_a < _b) ? _a : _b; })
+
+#define MAX(a,b) \
+ ({ __typeof__ (a) _a = (a); \
+     __typeof__ (b) _b = (b); \
+   (_a > _b) ? _a : _b; })
+
+#define GET_BUS(msg) (((msg)->RDTR >> 4) & 0xFF)
+
 #define GET_ADDR(msg) ((((msg)->RIR & 4) != 0) ? ((msg)->RIR >> 3) : ((msg)->RIR >> 21))
 #define GET_BYTE(msg, b) (((int)(b) > 3) ? (((msg)->RDHR >> (8U * ((unsigned int)(b) % 4U))) & 0XFFU) : (((msg)->RDLR >> (8U * (unsigned int)(b))) & 0xFFU))
 
@@ -45,6 +57,118 @@ can_buffer(tx3_q, 0x100)
 can_buffer(txgmlan_q, 0x100)
 can_ring *can_queues[] = {&can_tx1_q, &can_tx2_q, &can_tx3_q, &can_txgmlan_q};
 
+// params and flags about checksum, counter and frequency checks for each monitored address
+typedef struct {
+  // const params
+  const int addr[3];                 // check either messages (e.g. honda steer). Array MUST terminate with a zero to know its length.
+  const int bus;                     // bus where to expect the addr. Temp hack: -1 means skip the bus check
+  const bool check_checksum;         // true is checksum check is performed
+  const uint8_t max_counter;         // maximum value of the counter. 0 means that the counter check is skipped
+  const uint32_t expected_timestep;  // expected time between message updates [us]
+  // dynamic flags
+  bool valid_checksum;               // true if and only if checksum check is passed
+  int wrong_counters;                // counter of wrong counters, saturated between 0 and MAX_WRONG_COUNTERS
+  uint8_t last_counter;              // last counter value
+  uint32_t last_timestamp;           // micro-s
+  bool lagging;                      // true if and only if the time between updates is excessive
+} AddrCheckStruct;
+
+// sample struct that keeps 3 samples in memory
+struct sample_t {
+  int values[6];
+  int min;
+  int max;
+} sample_t_default = {{0}, 0, 0};
+
+// convert a trimmed integer to signed 32 bit int
+int to_signed(int d, int bits) {
+  int d_signed = d;
+  if (d >= (1 << MAX((bits - 1), 0))) {
+    d_signed = d - (1 << MAX(bits, 0));
+  }
+  return d_signed;
+}
+
+// given a new sample, update the smaple_t struct
+void update_sample(struct sample_t *sample, int sample_new) {
+  int sample_size = sizeof(sample->values) / sizeof(sample->values[0]);
+  for (int i = sample_size - 1; i > 0; i--) {
+    sample->values[i] = sample->values[i-1];
+  }
+  sample->values[0] = sample_new;
+
+  // get the minimum and maximum measured samples
+  sample->min = sample->values[0];
+  sample->max = sample->values[0];
+  for (int i = 1; i < sample_size; i++) {
+    if (sample->values[i] < sample->min) {
+      sample->min = sample->values[i];
+    }
+    if (sample->values[i] > sample->max) {
+      sample->max = sample->values[i];
+    }
+  }
+}
+
+bool max_limit_check(int val, const int MAX_VAL, const int MIN_VAL) {
+  return (val > MAX_VAL) || (val < MIN_VAL);
+}
+
+// real time check, mainly used for steer torque rate limiter
+bool rt_rate_limit_check(int val, int val_last, const int MAX_RT_DELTA) {
+
+  // *** torque real time rate limit check ***
+  int highest_val = MAX(val_last, 0) + MAX_RT_DELTA;
+  int lowest_val = MIN(val_last, 0) - MAX_RT_DELTA;
+
+  // check for violation
+  return (val < lowest_val) || (val > highest_val);
+}
+
+// compute the time elapsed (in microseconds) from 2 counter samples
+// case where ts < ts_last is ok: overflow is properly re-casted into uint32_t
+uint32_t get_ts_elapsed(uint32_t ts, uint32_t ts_last) {
+  return ts - ts_last;
+}
+
+int get_addr_check_index(CAN_FIFOMailBox_TypeDef *to_push, AddrCheckStruct addr_list[], const int len) {
+  int bus = GET_BUS(to_push);
+  int addr = GET_ADDR(to_push);
+
+  int index = -1;
+  for (int i = 0; i < len; i++) {
+    for (uint8_t j = 0U; addr_list[i].addr[j] != 0; j++) {
+      if ((addr == addr_list[i].addr[j]) && (bus == addr_list[i].bus)) {
+        index = i;
+        goto Return;
+      }
+    }
+  }
+Return:
+  return index;
+}
+
+// check that commanded value isn't fighting against driver
+bool driver_limit_check(int val, int val_last, struct sample_t *val_driver,
+  const int MAX_VAL, const int MAX_RATE_UP, const int MAX_RATE_DOWN,
+  const int MAX_ALLOWANCE, const int DRIVER_FACTOR) {
+
+  int highest_allowed_rl = MAX(val_last, 0) + MAX_RATE_UP;
+  int lowest_allowed_rl = MIN(val_last, 0) - MAX_RATE_UP;
+
+  int driver_max_limit = MAX_VAL + (MAX_ALLOWANCE + val_driver->max) * DRIVER_FACTOR;
+  int driver_min_limit = -MAX_VAL + (-MAX_ALLOWANCE + val_driver->min) * DRIVER_FACTOR;
+
+  // if we've exceeded the applied torque, we must start moving toward 0
+  int highest_allowed = MIN(highest_allowed_rl, MAX(val_last - MAX_RATE_DOWN,
+                                             MAX(driver_max_limit, 0)));
+  int lowest_allowed = MAX(lowest_allowed_rl, MIN(val_last + MAX_RATE_DOWN,
+                                           MIN(driver_min_limit, 0)));
+
+  // check for violation
+  return (val < lowest_allowed) || (val > highest_allowed);
+}
+
 const int GM_MAX_STEER = 300;
 const int GM_MAX_RT_DELTA = 128;          // max delta torque allowed for real time checks
 const uint32_t GM_RT_INTERVAL = 250000;    // 250ms between real time checks
@@ -54,6 +178,11 @@ const int GM_DRIVER_TORQUE_ALLOWANCE = 50;
 const int GM_DRIVER_TORQUE_FACTOR = 4;
 const int GM_MAX_GAS = 4500;
 const int GM_MAX_REGEN = 1404;
+
+int gm_rt_torque_last = 0;
+int gm_desired_torque_last = 0;
+uint32_t gm_ts_last = 0;
+struct sample_t gm_torque_driver;         // last few driver torques measured
 
 int can_err_cnt = 0;
 int can0_mailbox_full_cnt = 0;
@@ -69,12 +198,17 @@ uint8_t ascm_acc_cmd_active = 0;
 void can_send(CAN_FIFOMailBox_TypeDef *to_push, uint8_t bus_number);
 bool can_pop(can_ring *q, CAN_FIFOMailBox_TypeDef *elem);
 void send_interceptor_status();
+void send_steering_msg(uint32_t tick);
 
+CAN_FIFOMailBox_TypeDef steering_oem;
+volatile int steering_oem_ttl = 0;
+
+uint8_t steering_violation_cnt = 0;
 
 // overrides
 CAN_FIFOMailBox_TypeDef steering_override;
 volatile int steering_override_ttl = 0;
-int steering_rolling_counter;
+volatile uint8_t steering_rolling_counter = 0;
 
 CAN_FIFOMailBox_TypeDef gas_regen_override;
 volatile int gas_regen_override_ttl = 0;
@@ -482,7 +616,7 @@ void can_sce(CAN_TypeDef *CAN) {
 
 void ttl_timer_init() {
   TIM3->PSC = 4800-1;	        // Set prescaler to 24 000 (PSC + 1)
-  TIM3->ARR = 1000;	          // Auto reload value 1000
+  TIM3->ARR = 200-1;	          // Auto reload value 1000
   TIM3->DIER = TIM_DIER_UIE; // Enable update interrupt (timer level)
   TIM3->CR1 = TIM_CR1_CEN;   // Enable timer
 
@@ -495,6 +629,9 @@ if (TIM3->SR & TIM_SR_UIF) // if UIF flag is set
   {
     TIM3->SR &= ~TIM_SR_UIF; // clear UIF flag
     enter_critical_section();
+    if (steering_oem_ttl > 0) {
+        steering_oem_ttl--;
+    }
     if (steering_override_ttl > 0) {
         steering_override_ttl--;
     }
@@ -507,9 +644,10 @@ if (TIM3->SR & TIM_SR_UIF) // if UIF flag is set
     exit_critical_section();
 
     tick++;
-    if (tick % 1 == 0) {
+    if (tick % 5 == 0) {
         send_interceptor_status();
     }
+    send_steering_msg(tick);
   }
 }
 
@@ -526,11 +664,90 @@ void send_interceptor_status() {
     status.RDTR = 8;
     status.RDLR = 0;
     status.RDLR |= ascm_acc_cmd_active;
-    status.RDHR = 0x05060708;
+    status.RDHR = 0xFFFFFFFF | steering_violation_cnt;
 
     can_push(can_queues[0], &status);
     process_can(CAN_NUM_FROM_BUS_NUM(0));
 }	
+
+void send_steering_msg(uint32_t tick) {
+    CAN_FIFOMailBox_TypeDef steer;
+    steer.RIR = (384 << 21) | 1;
+
+    if (steering_override_ttl > 0) {
+    	steer.RDTR = steering_override.RDTR;
+    	steer.RDLR = steering_override.RDLR;
+    	steer.RDHR = steering_override.RDHR;
+    }
+    else if (steering_oem_ttl > 0) {
+        steer.RDTR = steering_oem.RDTR;
+	steer.RDLR = steering_oem.RDLR;
+	steer.RDHR = steering_oem.RDHR;
+    }
+    else {
+        return;
+    }
+
+    // Only update at 10 Hz when not active
+    uint8_t active = (steer.RDLR >> 3) & 0x1U;
+    if (!active && (tick % 5 != 0))
+        return;
+
+    // Pull out LKA Steering CMD data and swap endianness (not including rolling counter)
+    uint32_t dataswap = ((steer.RDLR << 8) & 0x0F00U) | ((steer.RDLR >> 8) &0xFFU);
+    uint32_t checksum = (0x1000 - dataswap - steering_rolling_counter) & 0x0fff;
+
+    //Swap endianness of checksum back to what GM expects
+    uint32_t checksumswap = (checksum >> 8) | ((checksum << 8) & 0xFF00U);
+
+    // Merge the rewritten checksum back into the BxCAN frame RDLR
+    steer.RDLR = (steer.RDLR & 0x0000FFCF) | (checksumswap << 16) | (steering_rolling_counter << 4);
+
+    steering_rolling_counter++;
+    steering_rolling_counter %= 4;
+
+    // LKA STEER: safety check
+    int desired_torque = ((GET_BYTE(&steer, 0) & 0x7U) << 8) + GET_BYTE(&steer, 1);
+    //uint32_t ts = TIM2->CNT;
+    bool violation = 0;
+    desired_torque = to_signed(desired_torque, 11);
+
+    // *** global torque limit check ***
+    violation |= max_limit_check(desired_torque, GM_MAX_STEER, -GM_MAX_STEER);
+
+    // *** torque rate limit check ***
+    //violation |= driver_limit_check(desired_torque, gm_desired_torque_last, &gm_torque_driver,
+    //  GM_MAX_STEER, GM_MAX_RATE_UP, GM_MAX_RATE_DOWN,
+    //  GM_DRIVER_TORQUE_ALLOWANCE, GM_DRIVER_TORQUE_FACTOR);
+
+    // used next time
+    //gm_desired_torque_last = desired_torque;
+
+    // *** torque real time rate limit check ***
+    //violation |= rt_rate_limit_check(desired_torque, gm_rt_torque_last, GM_MAX_RT_DELTA);
+
+    // every RT_INTERVAL set the new limits
+    //uint32_t ts_elapsed = get_ts_elapsed(ts, gm_ts_last);
+    //if (ts_elapsed > GM_RT_INTERVAL) {
+    //  gm_rt_torque_last = desired_torque;
+    //  gm_ts_last = ts;
+    //}
+    
+    // reset to 0 if there's a violation
+    //if (violation || (desired_torque == 0)) {
+    //  gm_desired_torque_last = 0;
+    //  gm_rt_torque_last = 0;
+    //  gm_ts_last = ts;
+    //}
+
+    if (violation) {
+      steering_violation_cnt++;
+      return;
+    }
+
+    can_push(can_queues[0], &steer);
+    process_can(CAN_NUM_FROM_BUS_NUM(0));
+}
 
 void handle_update_steering_override(CAN_FIFOMailBox_TypeDef *override_msg) {
     steering_override.RIR = (384 << 21) | (override_msg->RIR & 0x1FFFFFU);
@@ -538,7 +755,16 @@ void handle_update_steering_override(CAN_FIFOMailBox_TypeDef *override_msg) {
     steering_override.RDLR = override_msg->RDLR;
     steering_override.RDHR = override_msg->RDHR;
 
-    steering_override_ttl = 5;
+    steering_override_ttl = 50;
+}
+
+void handle_update_steering_oem(CAN_FIFOMailBox_TypeDef *oem_msg) {
+    steering_oem.RIR =  oem_msg->RIR;
+    steering_oem.RDTR = oem_msg->RDTR;
+    steering_oem.RDLR = oem_msg->RDLR;
+    steering_oem.RDHR = oem_msg->RDHR;
+
+    steering_oem_ttl = 50;
 }
 
 void handle_update_gasregencmd_override(CAN_FIFOMailBox_TypeDef *override_msg) {
@@ -547,7 +773,7 @@ void handle_update_gasregencmd_override(CAN_FIFOMailBox_TypeDef *override_msg) {
     gas_regen_override.RDLR = override_msg->RDLR;
     gas_regen_override.RDHR = override_msg->RDHR;
 
-    gas_regen_override_ttl = 5;
+    gas_regen_override_ttl = 50;
 }
 
 
@@ -561,10 +787,6 @@ bool handle_update_gasregencmd_override_rolling_counter(uint32_t rolling_counter
 
   // GAS/REGEN: safety check - TODO disable system instead of just dropping out of saftey range messages
   int gas_regen = ((GET_BYTE(&gas_regen_override, 2) & 0x7FU) << 5) + ((GET_BYTE(&gas_regen_override, 3) & 0xF8U) >> 3);
-  //bool apply = GET_BYTE(&gas_regen_override, 0) & 1U;
-  //if (apply || (gas_regen != GM_MAX_REGEN)) {
-  //  return false;
-  //}
   if (gas_regen > GM_MAX_GAS) {
     return false;
   }
@@ -577,7 +799,7 @@ void handle_update_acc_status_override(CAN_FIFOMailBox_TypeDef *override_msg) {
   acc_status_override.RDLR = override_msg->RDLR;
   acc_status_override.RDHR = override_msg->RDHR;
 
-  acc_status_ttl = 5;
+  acc_status_ttl = 50;
 }
 
 int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
@@ -585,7 +807,19 @@ int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
   
   // CAR to ASCM
   if (bus_num == 0) {
-    // 383 == lkasteeringcmd proxy : Unused for now
+    // 383 == lkasteeringcmd proxy
+    if (addr == 383) {
+      handle_update_steering_override(to_fwd);
+      return -1;
+    }
+    // Get driver applied torque for safety check and then forward to ASCM
+    //if (addr == 388) {
+    //  int torque_driver_new = ((GET_BYTE(to_fwd, 6) & 0x7) << 8) | GET_BYTE(to_fwd, 7);
+    //  torque_driver_new = to_signed(torque_driver_new, 11);
+    //  // update array of samples
+    //  update_sample(&gm_torque_driver, torque_driver_new);
+    //  return 2;
+    //}
     // 714 == gasregencmd proxy
     if (addr == 714) {
       handle_update_gasregencmd_override(to_fwd);
@@ -606,8 +840,10 @@ int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
 
   // ASCM to CAR
   if (bus_num == 2) {
-    // 384 == lkasteeringcmd : Silance OEM system at all times because it sucks and doesn't cause a dash error
+    // 384 == lkasteeringcmd : Only update, steering is more complex because it cycles between 10 Hz and 50 Hz
+    // so this interceptor needs to be the heartbeat
     if (addr == 384) {
+      handle_update_steering_oem(to_fwd);
       return -1;
     }
     // 715 == gasregencmd
