@@ -25,7 +25,9 @@ chassis: 0x170: electronic brake control module
 chassis: 0x1E5: steering angle sensor
 chassis: 0xC0: Seems to be needed for auto highbeams
 
+powertrain proxy 0x17F lkasteeringcmd proxy
 powertrain proxy 0x2CA gas regen proxy
+powertrain proxy 0x36F ASCMActiveCruiseControlStatus proxy
 */
 
 #define MIN(a,b) \
@@ -343,6 +345,7 @@ void process_can(uint8_t can_number) {
   }
 }
 
+/*
 void can_init(uint8_t can_number) {
   if (can_number == 0xff) return;
 
@@ -493,6 +496,120 @@ void can_init_hw(uint8_t can_number) {
 
   // in case there are queued up messages
   process_can(can_number);
+}
+*/
+
+void can_init(uint8_t can_number) {
+  if (can_number == 0xff) return;
+
+  CAN_TypeDef *CAN = CANIF_FROM_CAN_NUM(can_number);
+  set_can_enable(CAN, 1);
+  can_set_speed(can_number);
+
+  // Wait for INAK bit to be set
+  while(((CAN->MSR & CAN_MSR_INAK) == CAN_MSR_INAK)) {}
+
+  // no mask
+  //CAN->FS1R|=CAN_FS1R_FSC0;
+
+  if (can_number == 0) {
+    // filter master register - Set filter init mode
+    CAN->FMR |= CAN_FMR_FINIT;
+
+    // Assign 14 filter banks to CAN 1 and 2 each
+    CAN->FMR |= (((uint32_t) 14) << CAN_FMR_CAN2SB_Pos) & CAN_FMR_CAN2SB_Msk;
+ 
+    // filter mode register - CAN_FM1R_FBMX bit sets the associated filter bank to list mode. Only message IDs listed will be pushed to the rx fifo (vs ID mask mode)
+    CAN->FM1R = 0x00000000; // FM1R reset value
+    CAN->FM1R |= CAN_FM1R_FBM0 | CAN_FM1R_FBM1 | CAN_FM1R_FBM2 | CAN_FM1R_FBM3 | CAN_FM1R_FBM4 | CAN_FM1R_FBM5 | CAN_FM1R_FBM6 | CAN_FM1R_FBM7 | CAN_FM1R_FBM8 | CAN_FM1R_FBM9 | CAN_FM1R_FBM14 | CAN_FM1R_FBM15;
+    // filter scale register - Set all filter banks to be 32-bit (vs dual 16 bit)
+    CAN->FS1R = 0x00000000; // Reset value
+
+    // filter FIFO assignment register - Set all filters to store in FIFO 0 
+    CAN->FFA1R = 0x00000000;
+
+    // filter activation register - CAN_FA1R_FACTX bit activate the associated filter bank
+    CAN->FA1R = 0x00000000; // Reset value
+    CAN->FA1R |= CAN_FA1R_FACT0 | CAN_FA1R_FACT1 | CAN_FA1R_FACT2 | CAN_FA1R_FACT3 | CAN_FA1R_FACT4 | CAN_FA1R_FACT5 | CAN_FA1R_FACT6 | CAN_FA1R_FACT7 | CAN_FA1R_FACT8 | CAN_FA1R_FACT9 | CAN_FA1R_FACT14 | CAN_FA1R_FACT15;
+
+    //Set CAN 1 Filters
+    CAN->sFilterRegister[0].FR1 = 0x24B<<21;
+    CAN->sFilterRegister[0].FR2 = 0xF1<<21;
+    CAN->sFilterRegister[1].FR1 = 0xC9<<21;
+    CAN->sFilterRegister[1].FR2 = 0x1E9<<21;
+    CAN->sFilterRegister[2].FR1 = 0x1C4<<21;
+    CAN->sFilterRegister[2].FR2 = 0x1C5<<21;
+    CAN->sFilterRegister[3].FR1 = 0x1F5<<21;
+    CAN->sFilterRegister[3].FR2 = 0x1E1<<21;
+    CAN->sFilterRegister[4].FR1 = 0x214<<21;
+    CAN->sFilterRegister[4].FR2 = 0x230<<21;
+    CAN->sFilterRegister[5].FR1 = 0x34A<<21;
+    CAN->sFilterRegister[5].FR2 = 0x12A<<21;
+    CAN->sFilterRegister[6].FR1 = 0x135<<21;
+    CAN->sFilterRegister[6].FR2 = 0x184<<21;
+    CAN->sFilterRegister[7].FR1 = 0x1F1<<21;
+    CAN->sFilterRegister[7].FR2 = 0x140<<21;
+    CAN->sFilterRegister[8].FR1 = 0x2CA<<21;
+    CAN->sFilterRegister[8].FR2 = 0x17F<<21;
+    CAN->sFilterRegister[9].FR1 = 0x36F<<21;
+    CAN->sFilterRegister[9].FR1 = 0x36F<<21;
+ 
+    // Set Can 2 Filters
+    CAN->sFilterRegister[14].FR1 = 0x17F<<21;
+    CAN->sFilterRegister[14].FR2 = 0x2CA<<21;
+    CAN->sFilterRegister[15].FR1 = 0x36F<<21;
+    CAN->sFilterRegister[15].FR2 = 0x36F<<21;
+
+    CAN->FMR &= ~(CAN_FMR_FINIT);
+  }
+  if (can_number == 2) {
+    // filter master register - Set filter init mode
+    CAN->FMR |= CAN_FMR_FINIT;
+
+    // filter mode register - Set all filter banks to mask mode
+    CAN->FM1R = 0x00000000; // Reset value
+
+    // filter scale register - Set all filter banks to be 32-bit (vs dual 16 bit)
+    CAN->FS1R = 0x00000000; // Reset value
+
+    // filter FIFO assignment register - Set all filters to store in FIFO 0
+    CAN->FFA1R = 0x00000000; // Reset value
+
+    // filter activation register - CAN_FA1R_FACTX bit activate the associated filter bank
+    CAN->FA1R = 0x00000000; // Reset value
+    CAN->FA1R |= CAN_FA1R_FACT0;
+
+    // Filter bank registers - A mask of 0 accepts all message IDs and stores in the associated FIFO
+    CAN->sFilterRegister[0].FR1 = 0;
+    CAN->sFilterRegister[0].FR2 = 0;
+ 
+    CAN->FMR &= ~(CAN_FMR_FINIT);
+  }
+
+
+  // enable certain CAN interrupts
+  CAN->IER |= CAN_IER_TMEIE | CAN_IER_FMPIE0;
+  //NVIC_EnableIRQ(CAN_IER_TMEIE);
+  switch (can_number) {
+    case 0:
+      NVIC_EnableIRQ(CAN1_TX_IRQn);
+      NVIC_EnableIRQ(CAN1_RX0_IRQn);
+      NVIC_EnableIRQ(CAN1_SCE_IRQn);
+      break;
+    case 1:
+      NVIC_EnableIRQ(CAN2_TX_IRQn);
+      NVIC_EnableIRQ(CAN2_RX0_IRQn);
+      NVIC_EnableIRQ(CAN2_SCE_IRQn);
+      break;
+    case 2:
+      NVIC_EnableIRQ(CAN3_TX_IRQn);
+      NVIC_EnableIRQ(CAN3_RX0_IRQn);
+      NVIC_EnableIRQ(CAN3_SCE_IRQn);
+      break;
+  }
+
+  // in case there are queued up messages
+  //process_can(can_number);
 }
 
 int can_overflow_cnt = 0;
@@ -836,6 +953,30 @@ int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
       //to_fwd->RDHR = UNPRESS_MSG[button_message_counter];
     //}
     return 2;
+  }
+
+  // CAR to ASCM OBJ
+  if (bus_num == 1) {
+    // 383 == lkasteeringcmd proxy
+    if (addr == 383) {
+      handle_update_steering_override(to_fwd);
+    }
+    // Get driver applied torque for safety check and then forward to ASCM
+    //if (addr == 388) {
+    //  int torque_driver_new = ((GET_BYTE(to_fwd, 6) & 0x7) << 8) | GET_BYTE(to_fwd, 7);
+    //  torque_driver_new = to_signed(torque_driver_new, 11);
+    //  // update array of samples
+    //  update_sample(&gm_torque_driver, torque_driver_new);
+    //}
+    // 714 == gasregencmd proxy
+    if (addr == 714) {
+      handle_update_gasregencmd_override(to_fwd);
+    }
+    // 879 == ASCMActiveCruiseControlStatus proxy
+    if (addr == 879) {
+      handle_update_acc_status_override(to_fwd);
+    }
+    return -1;
   }
 
   // ASCM to CAR

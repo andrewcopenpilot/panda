@@ -201,12 +201,12 @@ int main() {
   usb_init();
 
   set_esp_mode(ESP_DISABLED);
-  can_set_gmlan(1);
 
-  //delay(20000000);
+  delay(10000000);
   can_init_all();
   delay(10000000);
-  can_init_hw(0);
+  can_init(0);
+  //can_init_hw(0);
 
   adc_init();
 
