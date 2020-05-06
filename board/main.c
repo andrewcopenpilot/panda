@@ -204,9 +204,6 @@ int main() {
 
   delay(10000000);
   can_init_all();
-  delay(10000000);
-  can_init(0);
-  //can_init_hw(0);
 
   adc_init();
 
