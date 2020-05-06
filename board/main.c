@@ -200,7 +200,6 @@ int main() {
   usb_init();
 
   set_esp_mode(ESP_DISABLED);
-  can_set_gmlan(1);
   can_init_all();
 
   adc_init();
@@ -214,6 +213,7 @@ int main() {
   // if the error interrupt is enabled to quickly when the CAN bus is active
   // something bad happens and you can't connect to the device over USB
   delay(10000000);
+
   CAN1->IER |= CAN_IER_ERRIE | CAN_IER_LECIE;
 
   // LED should keep on blinking all the time

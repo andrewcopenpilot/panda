@@ -146,13 +146,34 @@ void can_init(uint8_t can_number) {
   set_can_enable(CAN, 1);
   can_set_speed(can_number);
 
-  // accept all filter
-  CAN->FMR |= CAN_FMR_FINIT;
+  // Wait for INAK bit to be set
+  while(((CAN->MSR & CAN_MSR_INAK) == CAN_MSR_INAK)) {}
 
   // no mask
-  CAN->FS1R|=CAN_FS1R_FSC0;
+  //CAN->FS1R|=CAN_FS1R_FSC0;
 
   if (can_number == 0) {
+    // filter master register - Set filter init mode
+    CAN->FMR |= CAN_FMR_FINIT;
+
+    // Assign 14 filter banks to CAN 1 and 2 each
+    CAN->FMR |= (((uint32_t) 14) << CAN_FMR_CAN2SB_Pos) & CAN_FMR_CAN2SB_Msk;
+ 
+    // filter mode register - CAN_FM1R_FBMX bit sets the associated filter bank to list mode. Only message IDs listed will be pushed to the rx fifo (vs ID mask mode)
+    CAN->FM1R = 0x00000000; // FM1R reset value
+    CAN->FM1R |= CAN_FM1R_FBM0 | CAN_FM1R_FBM1 | CAN_FM1R_FBM2 | CAN_FM1R_FBM3 | CAN_FM1R_FBM14;
+
+    // filter scale register - Set all filter banks to be 32-bit (vs dual 16 bit)
+    CAN->FS1R = 0x00000000; // Reset value
+
+    // filter FIFO assignment register - Set all filters to store in FIFO 0 
+    CAN->FFA1R = 0x00000000;
+
+    // filter activation register - CAN_FA1R_FACTX bit activate the associated filter bank
+    CAN->FA1R = 0x00000000; // Reset value
+    CAN->FA1R |= CAN_FA1R_FACT0 | CAN_FA1R_FACT1 | CAN_FA1R_FACT2 | CAN_FA1R_FACT3 | CAN_FA1R_FACT14;
+
+    //Set CAN 1 Filters
     CAN->sFilterRegister[0].FR1 = 0xC1<<21;
     CAN->sFilterRegister[0].FR2 = 0xC5<<21;
     CAN->sFilterRegister[1].FR1 = 0x130<<21;
@@ -161,22 +182,37 @@ void can_init(uint8_t can_number) {
     CAN->sFilterRegister[2].FR2 = 0x1E5<<21;
     CAN->sFilterRegister[3].FR1 = 0xC0<<21;
     CAN->sFilterRegister[3].FR2 = 0x314<<21;
-    CAN->sFilterRegister[14].FR1 = 0;
-    CAN->sFilterRegister[14].FR2 = 0;
-    CAN->FM1R |= CAN_FM1R_FBM0 | CAN_FM1R_FBM1 | CAN_FM1R_FBM2 | CAN_FM1R_FBM3;
-    CAN->FA1R |= CAN_FA1R_FACT0 | CAN_FA1R_FACT1 | CAN_FA1R_FACT2 | CAN_FA1R_FACT3;
-    CAN->FA1R |= (1 << 14);
-    CAN->FFA1R = 0x00000000;
+
+    // Set Can 2 Filters
+    CAN->sFilterRegister[14].FR1 = 0x314<<21;
+    CAN->sFilterRegister[14].FR2 = 0x315<<21;
+
+    CAN->FMR &= ~(CAN_FMR_FINIT);
   }
-  else {
+  if (can_number == 2) {
+    // filter master register - Set filter init mode
+    CAN->FMR |= CAN_FMR_FINIT;
+
+    // filter mode register - Set all filter banks to mask mode
+    CAN->FM1R = 0x00000000; // Reset value
+
+    // filter scale register - Set all filter banks to be 32-bit (vs dual 16 bit)
+    CAN->FS1R = 0x00000000; // Reset value
+
+    // filter FIFO assignment register - Set all filters to store in FIFO 0
+    CAN->FFA1R = 0x00000000; // Reset value
+
+    // filter activation register - CAN_FA1R_FACTX bit activate the associated filter bank
+    CAN->FA1R = 0x00000000; // Reset value
+    CAN->FA1R |= CAN_FA1R_FACT0;
+
+    // Filter bank registers - A mask of 0 accepts all message IDs and stores in the associated FIFO
     CAN->sFilterRegister[0].FR1 = 0;
     CAN->sFilterRegister[0].FR2 = 0;
-    CAN->sFilterRegister[14].FR1 = 0;
-    CAN->sFilterRegister[14].FR2 = 0;
-    CAN->FA1R |= 1 | (1 << 14);
+ 
+    CAN->FMR &= ~(CAN_FMR_FINIT);
   }
 
-  CAN->FMR &= ~(CAN_FMR_FINIT);
 
   // enable certain CAN interrupts
   CAN->IER |= CAN_IER_TMEIE | CAN_IER_FMPIE0;
@@ -450,6 +486,15 @@ int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
       return -1;
     }
     return 2;
+  }
+
+  // CAR to ASCM Obj
+  if (bus_num == 1) {
+    // brake proxy
+    if (addr == 788) {
+      handle_update_brake_override(to_fwd);
+    }
+    return -1;
   }
 
   // ASCM to CAR
