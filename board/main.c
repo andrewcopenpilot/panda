@@ -202,8 +202,9 @@ int main() {
 
   set_esp_mode(ESP_DISABLED);
 
-  delay(10000000);
   can_init_all();
+  delay(10000000);
+  can_init_hw();
 
   adc_init();
 

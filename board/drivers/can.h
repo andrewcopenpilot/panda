@@ -448,7 +448,70 @@ void can_init_all() {
   can_set_speed(2);
 
   // in case there are queued up messages
-  //process_can(can_number);
+  process_can(0);
+  process_can(1);
+  process_can(2);
+}
+
+void can_init_hw() {
+  CAN_TypeDef *CAN = CANIF_FROM_CAN_NUM(0);
+  set_can_enable(CAN, 1);
+  can_set_speed(0);
+
+  // accept all filter
+  CAN->FMR |= CAN_FMR_FINIT;
+
+  // no mask
+  CAN->FS1R|=CAN_FS1R_FSC0;
+
+  //Set CAN 1 Filters
+  CAN1->sFilterRegister[0].FR1 = 0x24B<<21;
+  CAN1->sFilterRegister[0].FR2 = 0xF1<<21;
+  CAN1->sFilterRegister[1].FR1 = 0xC9<<21;
+  CAN1->sFilterRegister[1].FR2 = 0x1E9<<21;
+  CAN1->sFilterRegister[2].FR1 = 0x1C4<<21;
+  CAN1->sFilterRegister[2].FR2 = 0x1C5<<21;
+  CAN1->sFilterRegister[3].FR1 = 0x1F5<<21;
+  CAN1->sFilterRegister[3].FR2 = 0x1E1<<21;
+  CAN1->sFilterRegister[4].FR1 = 0x214<<21;
+  CAN1->sFilterRegister[4].FR2 = 0x230<<21;
+  CAN1->sFilterRegister[5].FR1 = 0x34A<<21;
+  CAN1->sFilterRegister[5].FR2 = 0x12A<<21;
+  CAN1->sFilterRegister[6].FR1 = 0x135<<21;
+  CAN1->sFilterRegister[6].FR2 = 0x184<<21;
+  CAN1->sFilterRegister[7].FR1 = 0x1F1<<21;
+  CAN1->sFilterRegister[7].FR2 = 0x140<<21;
+  CAN1->sFilterRegister[8].FR1 = 0x2CA<<21;
+  CAN1->sFilterRegister[8].FR2 = 0x17F<<21;
+  CAN1->sFilterRegister[9].FR1 = 0x36F<<21;
+  CAN1->sFilterRegister[9].FR1 = 0x36F<<21;
+ 
+  // Set Can 2 Filters
+  CAN1->sFilterRegister[14].FR1 = 0x17F<<21;
+  CAN1->sFilterRegister[14].FR2 = 0x2CA<<21;
+  CAN1->sFilterRegister[15].FR1 = 0x36F<<21;
+  CAN1->sFilterRegister[15].FR2 = 0x36F<<21;
+
+
+  CAN1->FM1R |= CAN_FM1R_FBM0 | CAN_FM1R_FBM1 | CAN_FM1R_FBM2 | CAN_FM1R_FBM3 | CAN_FM1R_FBM4 | CAN_FM1R_FBM5 | CAN_FM1R_FBM6 | CAN_FM1R_FBM7 | CAN_FM1R_FBM8 | CAN_FM1R_FBM9 | CAN_FM1R_FBM14 | CAN_FM1R_FBM15;
+
+  CAN1->FA1R |= CAN_FA1R_FACT0 | CAN_FA1R_FACT1 | CAN_FA1R_FACT2 | CAN_FA1R_FACT3 | CAN_FA1R_FACT4 | CAN_FA1R_FACT5 | CAN_FA1R_FACT6 | CAN_FA1R_FACT7 | CAN_FA1R_FACT8 | CAN_FA1R_FACT9 | CAN_FA1R_FACT14 | CAN_FA1R_FACT15;
+
+
+  CAN->FA1R |= (1 << 14);
+  CAN->FFA1R = 0x00000000;
+
+  CAN->FMR &= ~(CAN_FMR_FINIT);
+
+  // enable certain CAN interrupts
+  CAN->IER |= CAN_IER_TMEIE | CAN_IER_FMPIE0;
+  //NVIC_EnableIRQ(CAN_IER_TMEIE);
+  NVIC_EnableIRQ(CAN1_TX_IRQn);
+  NVIC_EnableIRQ(CAN1_RX0_IRQn);
+  NVIC_EnableIRQ(CAN1_SCE_IRQn);
+
+  // in case there are queued up messages
+  process_can(0);
 }
 
 int can_overflow_cnt = 0;
@@ -492,6 +555,7 @@ int can_push(can_ring *q, CAN_FIFOMailBox_TypeDef *elem) {
   return ret;
 }
 
+/*
 // single wire (low speed) GMLAN only used for button presses to change mode in the future
 void can_set_gmlan(int bus) {
   if (bus == -1 || bus != can_num_lookup[3]) {
@@ -534,6 +598,7 @@ void can_set_gmlan(int bus) {
     can_init(2);
   }
 }
+*/
 
 // CAN error
 void can_sce(CAN_TypeDef *CAN) {
