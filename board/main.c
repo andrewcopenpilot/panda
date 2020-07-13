@@ -200,7 +200,6 @@ int main() {
   usb_init();
 
   set_esp_mode(ESP_DISABLED);
-  can_set_gmlan(1);
   can_init_all();
 
   adc_init();
