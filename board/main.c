@@ -201,7 +201,6 @@ int main() {
   usb_init();
 
   set_esp_mode(ESP_DISABLED);
-  can_set_gmlan(1);
 
   //delay(20000000);
   can_init_all();
