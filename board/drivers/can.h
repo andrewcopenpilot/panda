@@ -16,6 +16,8 @@ powertrain: 0x184: power steering control module
 powertrain: 0x1F1: body control module
 powertrain: 0x140: body control module
 
+poertrain: 0x17D appears to be related to traction control status
+
 
 chassis: 0xC1: electronic brake control module
 chassis: 0xC5: electronic brake control module
@@ -363,6 +365,7 @@ void can_init_all() {
   // filter mode register - CAN_FM1R_FBMX bit sets the associated filter bank to list mode. Only message IDs listed will be pushed to the rx fifo (vs ID mask mode)
   CAN1->FM1R = 0x00000000; // FM1R reset value
   CAN1->FM1R |= CAN_FM1R_FBM0 | CAN_FM1R_FBM1 | CAN_FM1R_FBM2 | CAN_FM1R_FBM3 | CAN_FM1R_FBM4 | CAN_FM1R_FBM5 | CAN_FM1R_FBM6 | CAN_FM1R_FBM7 | CAN_FM1R_FBM8 | CAN_FM1R_FBM9 | CAN_FM1R_FBM14 | CAN_FM1R_FBM15;
+  
   // filter scale register - Set all filter banks to be 32-bit (vs dual 16 bit)
   CAN1->FS1R = 0x00000000; // Reset value
 
@@ -371,6 +374,7 @@ void can_init_all() {
 
   // filter activation register - CAN_FA1R_FACTX bit activate the associated filter bank
   CAN1->FA1R = 0x00000000; // Reset value
+
   CAN1->FA1R |= CAN_FA1R_FACT0 | CAN_FA1R_FACT1 | CAN_FA1R_FACT2 | CAN_FA1R_FACT3 | CAN_FA1R_FACT4 | CAN_FA1R_FACT5 | CAN_FA1R_FACT6 | CAN_FA1R_FACT7 | CAN_FA1R_FACT8 | CAN_FA1R_FACT9 | CAN_FA1R_FACT14 | CAN_FA1R_FACT15;
 
   //Set CAN 1 Filters
@@ -393,8 +397,8 @@ void can_init_all() {
   CAN1->sFilterRegister[8].FR1 = 0x2CA<<21;
   CAN1->sFilterRegister[8].FR2 = 0x17F<<21;
   CAN1->sFilterRegister[9].FR1 = 0x36F<<21;
-  CAN1->sFilterRegister[9].FR1 = 0x36F<<21;
- 
+  CAN1->sFilterRegister[9].FR2 = 0x17D<<21;
+
   // Set Can 2 Filters
   CAN1->sFilterRegister[14].FR1 = 0x17F<<21;
   CAN1->sFilterRegister[14].FR2 = 0x2CA<<21;
@@ -402,7 +406,8 @@ void can_init_all() {
   CAN1->sFilterRegister[15].FR2 = 0x36F<<21;
 
   CAN1->FMR &= ~(CAN_FMR_FINIT);
- 
+
+
   // filter master register - Set filter init mode
   CAN3->FMR |= CAN_FMR_FINIT;
 
@@ -484,7 +489,7 @@ void can_init_hw() {
   CAN1->sFilterRegister[8].FR1 = 0x2CA<<21;
   CAN1->sFilterRegister[8].FR2 = 0x17F<<21;
   CAN1->sFilterRegister[9].FR1 = 0x36F<<21;
-  CAN1->sFilterRegister[9].FR1 = 0x36F<<21;
+  CAN1->sFilterRegister[9].FR2 = 0x36F<<21;
  
   // Set Can 2 Filters
   CAN1->sFilterRegister[14].FR1 = 0x17F<<21;
