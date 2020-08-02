@@ -191,9 +191,14 @@ struct sample_t gm_torque_driver;         // last few driver torques measured
 int can_err_cnt = 0;
 int can0_mailbox_full_cnt = 0;
 int can1_mailbox_full_cnt = 0;
+int can2_mailbox_full_cnt = 0;
+
 int can0_rx_cnt = 0;
+int can1_rx_cnt = 0;
 int can2_rx_cnt = 0;
+
 int can0_tx_cnt = 0;
+int can1_tx_cnt = 0;
 int can2_tx_cnt = 0;
 
 uint32_t tick = 0;
@@ -337,6 +342,9 @@ void process_can(uint8_t can_number) {
 	if (can_number == 0) {
           can0_tx_cnt++;
         }
+	if (can_number == 1) {
+	  can1_tx_cnt++;
+	}
         if (can_number == 2) {
           can2_tx_cnt++;
         }
@@ -377,7 +385,7 @@ void can_init_all() {
 
   CAN1->FA1R |= CAN_FA1R_FACT0 | CAN_FA1R_FACT1 | CAN_FA1R_FACT2 | CAN_FA1R_FACT3 | CAN_FA1R_FACT4 | CAN_FA1R_FACT5 | CAN_FA1R_FACT6 | CAN_FA1R_FACT7 | CAN_FA1R_FACT8 | CAN_FA1R_FACT9 | CAN_FA1R_FACT14 | CAN_FA1R_FACT15;
 
-  //Set CAN 1 Filters
+  //Set CAN 1 Filters CAR PT
   CAN1->sFilterRegister[0].FR1 = 0x24B<<21;
   CAN1->sFilterRegister[0].FR2 = 0xF1<<21;
   CAN1->sFilterRegister[1].FR1 = 0xC9<<21;
@@ -394,16 +402,25 @@ void can_init_all() {
   CAN1->sFilterRegister[6].FR2 = 0x184<<21;
   CAN1->sFilterRegister[7].FR1 = 0x1F1<<21;
   CAN1->sFilterRegister[7].FR2 = 0x140<<21;
-  CAN1->sFilterRegister[8].FR1 = 0x2CA<<21;
-  CAN1->sFilterRegister[8].FR2 = 0x17F<<21;
-  CAN1->sFilterRegister[9].FR1 = 0x36F<<21;
-  CAN1->sFilterRegister[9].FR2 = 0x17D<<21;
+  CAN1->sFilterRegister[8].FR1 = 0x17D<<21;
+
+  CAN1->sFilterRegister[8].FR2 = 0x2CA<<21;
+  CAN1->sFilterRegister[9].FR1 = 0x17F<<21;
+  CAN1->sFilterRegister[9].FR2 = 0x36F<<21;
 
   // Set Can 2 Filters
+/*
+  CAN1->sFilterRegister[14].FR1 = 0;
+  CAN1->sFilterRegister[14].FR2 = 0;
+  CAN1->sFilterRegister[15].FR1 = 0;
+  CAN1->sFilterRegister[15].FR2 = 0;
+*/
+
   CAN1->sFilterRegister[14].FR1 = 0x17F<<21;
   CAN1->sFilterRegister[14].FR2 = 0x2CA<<21;
   CAN1->sFilterRegister[15].FR1 = 0x36F<<21;
   CAN1->sFilterRegister[15].FR2 = 0x36F<<21;
+
 
   CAN1->FMR &= ~(CAN_FMR_FINIT);
 
@@ -458,67 +475,6 @@ void can_init_all() {
   process_can(2);
 }
 
-void can_init_hw() {
-  CAN_TypeDef *CAN = CANIF_FROM_CAN_NUM(0);
-  set_can_enable(CAN, 1);
-  can_set_speed(0);
-
-  // accept all filter
-  CAN->FMR |= CAN_FMR_FINIT;
-
-  // no mask
-  CAN->FS1R|=CAN_FS1R_FSC0;
-
-  //Set CAN 1 Filters
-  CAN1->sFilterRegister[0].FR1 = 0x24B<<21;
-  CAN1->sFilterRegister[0].FR2 = 0xF1<<21;
-  CAN1->sFilterRegister[1].FR1 = 0xC9<<21;
-  CAN1->sFilterRegister[1].FR2 = 0x1E9<<21;
-  CAN1->sFilterRegister[2].FR1 = 0x1C4<<21;
-  CAN1->sFilterRegister[2].FR2 = 0x1C5<<21;
-  CAN1->sFilterRegister[3].FR1 = 0x1F5<<21;
-  CAN1->sFilterRegister[3].FR2 = 0x1E1<<21;
-  CAN1->sFilterRegister[4].FR1 = 0x214<<21;
-  CAN1->sFilterRegister[4].FR2 = 0x230<<21;
-  CAN1->sFilterRegister[5].FR1 = 0x34A<<21;
-  CAN1->sFilterRegister[5].FR2 = 0x12A<<21;
-  CAN1->sFilterRegister[6].FR1 = 0x135<<21;
-  CAN1->sFilterRegister[6].FR2 = 0x184<<21;
-  CAN1->sFilterRegister[7].FR1 = 0x1F1<<21;
-  CAN1->sFilterRegister[7].FR2 = 0x140<<21;
-  CAN1->sFilterRegister[8].FR1 = 0x2CA<<21;
-  CAN1->sFilterRegister[8].FR2 = 0x17F<<21;
-  CAN1->sFilterRegister[9].FR1 = 0x36F<<21;
-  CAN1->sFilterRegister[9].FR2 = 0x36F<<21;
- 
-  // Set Can 2 Filters
-  CAN1->sFilterRegister[14].FR1 = 0x17F<<21;
-  CAN1->sFilterRegister[14].FR2 = 0x2CA<<21;
-  CAN1->sFilterRegister[15].FR1 = 0x36F<<21;
-  CAN1->sFilterRegister[15].FR2 = 0x36F<<21;
-
-
-  CAN1->FM1R |= CAN_FM1R_FBM0 | CAN_FM1R_FBM1 | CAN_FM1R_FBM2 | CAN_FM1R_FBM3 | CAN_FM1R_FBM4 | CAN_FM1R_FBM5 | CAN_FM1R_FBM6 | CAN_FM1R_FBM7 | CAN_FM1R_FBM8 | CAN_FM1R_FBM9 | CAN_FM1R_FBM14 | CAN_FM1R_FBM15;
-
-  CAN1->FA1R |= CAN_FA1R_FACT0 | CAN_FA1R_FACT1 | CAN_FA1R_FACT2 | CAN_FA1R_FACT3 | CAN_FA1R_FACT4 | CAN_FA1R_FACT5 | CAN_FA1R_FACT6 | CAN_FA1R_FACT7 | CAN_FA1R_FACT8 | CAN_FA1R_FACT9 | CAN_FA1R_FACT14 | CAN_FA1R_FACT15;
-
-
-  CAN->FA1R |= (1 << 14);
-  CAN->FFA1R = 0x00000000;
-
-  CAN->FMR &= ~(CAN_FMR_FINIT);
-
-  // enable certain CAN interrupts
-  CAN->IER |= CAN_IER_TMEIE | CAN_IER_FMPIE0;
-  //NVIC_EnableIRQ(CAN_IER_TMEIE);
-  NVIC_EnableIRQ(CAN1_TX_IRQn);
-  NVIC_EnableIRQ(CAN1_RX0_IRQn);
-  NVIC_EnableIRQ(CAN1_SCE_IRQn);
-
-  // in case there are queued up messages
-  process_can(0);
-}
-
 int can_overflow_cnt = 0;
 
 // ********************* interrupt safe queue *********************
@@ -559,51 +515,6 @@ int can_push(can_ring *q, CAN_FIFOMailBox_TypeDef *elem) {
   }
   return ret;
 }
-
-/*
-// single wire (low speed) GMLAN only used for button presses to change mode in the future
-void can_set_gmlan(int bus) {
-  if (bus == -1 || bus != can_num_lookup[3]) {
-    // GMLAN OFF
-    switch (can_num_lookup[3]) {
-      case 1:
-        puts("disable GMLAN on CAN2\n");
-        set_can_mode(1, 0);
-        bus_lookup[1] = 1;
-        can_num_lookup[1] = 1;
-        can_num_lookup[3] = -1;
-        can_init(1);
-        break;
-      case 2:
-        puts("disable GMLAN on CAN3\n");
-        set_can_mode(2, 0);
-        bus_lookup[2] = 2;
-        can_num_lookup[2] = 2;
-        can_num_lookup[3] = -1;
-        can_init(2);
-        break;
-    }
-  }
-
-  if (bus == 1) {
-    puts("GMLAN on CAN2\n");
-    // GMLAN on CAN2
-    set_can_mode(1, 1);
-    bus_lookup[1] = 3;
-    can_num_lookup[1] = -1;
-    can_num_lookup[3] = 1;
-    can_init(1);
-  } else if (bus == 2 && revision == PANDA_REV_C) {
-    puts("GMLAN on CAN3\n");
-    // GMLAN on CAN3
-    set_can_mode(2, 1);
-    bus_lookup[2] = 3;
-    can_num_lookup[2] = -1;
-    can_num_lookup[3] = 2;
-    can_init(2);
-  }
-}
-*/
 
 // CAN error
 void can_sce(CAN_TypeDef *CAN) {
@@ -685,8 +596,8 @@ void send_interceptor_status() {
     status.RDLR |= ascm_acc_cmd_active;
     status.RDHR = 0xFFFFFFFF | steering_violation_cnt;
 
-    can_push(can_queues[0], &status);
-    process_can(CAN_NUM_FROM_BUS_NUM(0));
+    can_push(can_queues[1], &status);
+    process_can(CAN_NUM_FROM_BUS_NUM(1));
 }	
 
 void send_steering_msg(uint32_t tick) {
@@ -930,6 +841,9 @@ void can_rx(uint8_t can_number) {
     if (can_number == 0) {
       can0_rx_cnt++;
     }
+    if (can_number == 1) {
+      can1_rx_cnt++;
+    }
     if (can_number == 2) {
       can2_rx_cnt++;
     }
@@ -947,7 +861,6 @@ void can_rx(uint8_t can_number) {
     // forwarding
     int bus_fwd_num = fwd_filter(bus_number, &to_tx);
     if (bus_fwd_num != -1) {
-      //can_tx(bus_fwd_num, &to_tx);
       can_push(can_queues[bus_fwd_num], &to_tx);
       process_can(CAN_NUM_FROM_BUS_NUM(bus_fwd_num));
     }

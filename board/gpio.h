@@ -192,8 +192,8 @@ void set_can_mode(int can, int use_gmlan) {
       set_gpio_mode(GPIOB, 6, MODE_INPUT);
 
       // B12,B13: gmlan mode
-      set_gpio_alternate(GPIOB, 12, GPIO_AF9_CAN2);
-      set_gpio_alternate(GPIOB, 13, GPIO_AF9_CAN2);
+      //set_gpio_alternate(GPIOB, 12, GPIO_AF9_CAN2);
+      //set_gpio_alternate(GPIOB, 13, GPIO_AF9_CAN2);
 #ifdef CAN3
     } else if (revision == PANDA_REV_C && can == 2) {
       // A8,A15: disable normal mode
@@ -208,12 +208,12 @@ void set_can_mode(int can, int use_gmlan) {
   } else {
     if (can == 1) {
       // B12,B13: disable gmlan mode
-      set_gpio_mode(GPIOB, 12, MODE_INPUT);
-      set_gpio_mode(GPIOB, 13, MODE_INPUT);
+      //set_gpio_mode(GPIOB, 12, MODE_INPUT);
+      //set_gpio_mode(GPIOB, 13, MODE_INPUT);
 
       // B5,B6: normal mode
-      set_gpio_alternate(GPIOB, 5, GPIO_AF9_CAN2);
-      set_gpio_alternate(GPIOB, 6, GPIO_AF9_CAN2);
+      //set_gpio_alternate(GPIOB, 5, GPIO_AF9_CAN2);
+      //set_gpio_alternate(GPIOB, 6, GPIO_AF9_CAN2);
 #ifdef CAN3
     } else if (can == 2) {
       if(revision == PANDA_REV_C){
@@ -331,7 +331,7 @@ void gpio_init() {
   set_gpio_alternate(GPIOA, 10, GPIO_AF7_USART1);
 
   // B12: GMLAN, ignition sense, pull up
-  set_gpio_pullup(GPIOB, 12, PULL_UP);
+  //set_gpio_pullup(GPIOB, 12, PULL_UP);
 
   // A4,A5,A6,A7: setup SPI
   set_gpio_alternate(GPIOA, 4, GPIO_AF5_SPI1);
@@ -351,7 +351,10 @@ void gpio_init() {
   set_can_enable(CAN1, 1);
 
   // B5,B6: CAN 2
-  set_can_mode(1, 0);
+//  set_can_mode(1, 0);
+  set_gpio_alternate(GPIOB, 12, GPIO_AF9_CAN2);
+  set_gpio_alternate(GPIOB, 13, GPIO_AF9_CAN2);
+
   set_can_enable(CAN2, 1);
 
   // A8,A15: CAN 3
