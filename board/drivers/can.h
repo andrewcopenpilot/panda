@@ -28,6 +28,7 @@ chassis: 0xc0: seems to be needed for auto highbeams
 
 #define GET_ADDR(msg) ((((msg)->RIR & 4) != 0) ? ((msg)->RIR >> 3) : ((msg)->RIR >> 21))
 #define GET_BYTE(msg, b) (((int)(b) > 3) ? (((msg)->RDHR >> (8U * ((unsigned int)(b) % 4U))) & 0XFFU) : (((msg)->RDLR >> (8U * (unsigned int)(b))) & 0xFFU))
+#define CAN_TRANSMIT 1U
 
 // IRQs: CAN1_TX, CAN1_RX0, CAN1_SCE, CAN2_TX, CAN2_RX0, CAN2_SCE, CAN3_TX, CAN3_RX0, CAN3_SCE
 
@@ -49,8 +50,10 @@ int can_err_cnt = 0;
 int can0_mailbox_full_cnt = 0;
 int can1_mailbox_full_cnt = 0;
 int can0_rx_cnt = 0;
+int can1_rx_cnt = 0;
 int can2_rx_cnt = 0;
 int can0_tx_cnt = 0;
+int can1_tx_cnt = 0;
 int can2_tx_cnt = 0;
 
 uint32_t tick = 0;
@@ -108,6 +111,59 @@ uint32_t can_speed[] = {5000, 5000, 5000, 333};
 // 5000 = 500 kbps
 #define can_speed_to_prescaler(x) (CAN_PCLK / CAN_QUANTA * 10 / (x))
 
+void process_can(uint8_t can_number) {
+  if (can_number != 0xff) {
+
+    enter_critical_section();
+
+    CAN_TypeDef *CAN = CANIF_FROM_CAN_NUM(can_number);
+    uint8_t bus_number = BUS_NUM_FROM_CAN_NUM(can_number);
+
+    // check for empty mailbox
+    CAN_FIFOMailBox_TypeDef to_send;
+    if ((CAN->TSR & CAN_TSR_TME0) == CAN_TSR_TME0) {
+      // add successfully transmitted message to my fifo
+      if ((CAN->TSR & CAN_TSR_RQCP0) == CAN_TSR_RQCP0) {
+        if ((CAN->TSR & CAN_TSR_TERR0) == CAN_TSR_TERR0) {
+          #ifdef DEBUG
+            puts("CAN TX ERROR!\n");
+          #endif
+        }
+
+        if ((CAN->TSR & CAN_TSR_ALST0) == CAN_TSR_ALST0) {
+          #ifdef DEBUG
+            puts("CAN TX ARBITRATION LOST!\n");
+          #endif
+        }
+
+        // clear interrupt
+        // careful, this can also be cleared by requesting a transmission
+        CAN->TSR |= CAN_TSR_RQCP0;
+      }
+
+      if (can_pop(can_queues[bus_number], &to_send)) {
+        // only send if we have received a packet
+        CAN->sTxMailBox[0].TDLR = to_send.RDLR;
+        CAN->sTxMailBox[0].TDHR = to_send.RDHR;
+        CAN->sTxMailBox[0].TDTR = to_send.RDTR;
+        CAN->sTxMailBox[0].TIR = to_send.RIR;
+
+	if (can_number == 0) {
+          can0_tx_cnt++;
+        }
+        if (can_number == 1) {
+          can1_tx_cnt++;
+        }
+        if (can_number == 2) {
+          can2_tx_cnt++;
+        }
+      }
+    }
+
+    exit_critical_section();
+  }
+}
+
 void can_set_speed(uint8_t can_number) {
   CAN_TypeDef *CAN = CANIF_FROM_CAN_NUM(can_number);
   uint8_t bus_number = BUS_NUM_FROM_CAN_NUM(can_number);
@@ -139,104 +195,100 @@ void can_set_speed(uint8_t can_number) {
   }
 }
 
-void can_init(uint8_t can_number) {
-  if (can_number == 0xff) return;
-
-  CAN_TypeDef *CAN = CANIF_FROM_CAN_NUM(can_number);
-  set_can_enable(CAN, 1);
-  can_set_speed(can_number);
-
+void can_init_all() {
   // Wait for INAK bit to be set
-  while(((CAN->MSR & CAN_MSR_INAK) == CAN_MSR_INAK)) {}
+  while(((CAN1->MSR & CAN_MSR_INAK) == CAN_MSR_INAK)) {}
+  while(((CAN2->MSR & CAN_MSR_INAK) == CAN_MSR_INAK)) {}
+  while(((CAN3->MSR & CAN_MSR_INAK) == CAN_MSR_INAK)) {}
 
-  // no mask
-  //CAN->FS1R|=CAN_FS1R_FSC0;
+  // filter master register - Set filter init mode
+  CAN1->FMR |= CAN_FMR_FINIT;
 
-  if (can_number == 0) {
-    // filter master register - Set filter init mode
-    CAN->FMR |= CAN_FMR_FINIT;
+  // Assign 14 filter banks to CAN 1 and 2 each
+  CAN1->FMR |= (((uint32_t) 14) << CAN_FMR_CAN2SB_Pos) & CAN_FMR_CAN2SB_Msk;
 
-    // Assign 14 filter banks to CAN 1 and 2 each
-    CAN->FMR |= (((uint32_t) 14) << CAN_FMR_CAN2SB_Pos) & CAN_FMR_CAN2SB_Msk;
- 
-    // filter mode register - CAN_FM1R_FBMX bit sets the associated filter bank to list mode. Only message IDs listed will be pushed to the rx fifo (vs ID mask mode)
-    CAN->FM1R = 0x00000000; // FM1R reset value
-    CAN->FM1R |= CAN_FM1R_FBM0 | CAN_FM1R_FBM1 | CAN_FM1R_FBM2 | CAN_FM1R_FBM3 | CAN_FM1R_FBM14;
+  // filter mode register - CAN_FM1R_FBMX bit sets the associated filter bank to list mode. Only message IDs listed will be pushed to the rx fifo (vs ID mask mode)
+  CAN1->FM1R = 0x00000000; // FM1R reset value
+  CAN1->FM1R |= CAN_FM1R_FBM0 | CAN_FM1R_FBM1 | CAN_FM1R_FBM2 | CAN_FM1R_FBM3 | CAN_FM1R_FBM14 | CAN_FM1R_FBM15;
 
-    // filter scale register - Set all filter banks to be 32-bit (vs dual 16 bit)
-    CAN->FS1R = 0x00000000; // Reset value
+  // filter scale register - Set all filter banks to be 32-bit (vs dual 16 bit)
+  CAN1->FS1R = 0x00000000; // Reset value
 
-    // filter FIFO assignment register - Set all filters to store in FIFO 0 
-    CAN->FFA1R = 0x00000000;
+  // filter FIFO assignment register - Set all filters to store in FIFO 0
+  CAN1->FFA1R = 0x00000000;
 
-    // filter activation register - CAN_FA1R_FACTX bit activate the associated filter bank
-    CAN->FA1R = 0x00000000; // Reset value
-    CAN->FA1R |= CAN_FA1R_FACT0 | CAN_FA1R_FACT1 | CAN_FA1R_FACT2 | CAN_FA1R_FACT3 | CAN_FA1R_FACT14;
+  // filter activation register - CAN_FA1R_FACTX bit activate the associated filter bank
+  CAN1->FA1R = 0x00000000; // Reset value
 
-    //Set CAN 1 Filters
-    CAN->sFilterRegister[0].FR1 = 0xC1<<21;
-    CAN->sFilterRegister[0].FR2 = 0xC5<<21;
-    CAN->sFilterRegister[1].FR1 = 0x130<<21;
-    CAN->sFilterRegister[1].FR2 = 0x140<<21;
-    CAN->sFilterRegister[2].FR1 = 0x170<<21;
-    CAN->sFilterRegister[2].FR2 = 0x1E5<<21;
-    CAN->sFilterRegister[3].FR1 = 0xC0<<21;
-    CAN->sFilterRegister[3].FR2 = 0x314<<21;
+  CAN1->FA1R |= CAN_FA1R_FACT0 | CAN_FA1R_FACT1 | CAN_FA1R_FACT2 | CAN_FA1R_FACT3 | CAN_FA1R_FACT14 | CAN_FA1R_FACT15;
 
-    // Set Can 2 Filters
-    CAN->sFilterRegister[14].FR1 = 0x314<<21;
-    CAN->sFilterRegister[14].FR2 = 0x315<<21;
+  //Set CAN 1 Filters CAR Chas
+  CAN1->sFilterRegister[0].FR1 = 0xC1<<21;
+  CAN1->sFilterRegister[0].FR2 = 0xC5<<21;
+  CAN1->sFilterRegister[1].FR1 = 0x130<<21;
+  CAN1->sFilterRegister[1].FR2 = 0x140<<21;
+  CAN1->sFilterRegister[2].FR1 = 0x170<<21;
+  CAN1->sFilterRegister[2].FR2 = 0x1E5<<21;
+  CAN1->sFilterRegister[3].FR1 = 0xC0<<21;
+  CAN1->sFilterRegister[3].FR2 = 0xC0<<21;
 
-    CAN->FMR &= ~(CAN_FMR_FINIT);
-  }
-  if (can_number == 2) {
-    // filter master register - Set filter init mode
-    CAN->FMR |= CAN_FMR_FINIT;
+  // Set Can 2 Filters Obj
+  CAN1->sFilterRegister[14].FR1 = 0x315<<21; // Friction brake proxy
+  CAN1->sFilterRegister[14].FR2 = 0x375<<21; // PT Interceptor status
+  CAN1->sFilterRegister[15].FR1 = 0x377<<21; // SW GMLAN proxy status
+  CAN1->sFilterRegister[15].FR2 = 0x377<<21;
 
-    // filter mode register - Set all filter banks to mask mode
-    CAN->FM1R = 0x00000000; // Reset value
+  CAN1->FMR &= ~(CAN_FMR_FINIT);
 
-    // filter scale register - Set all filter banks to be 32-bit (vs dual 16 bit)
-    CAN->FS1R = 0x00000000; // Reset value
+  // filter master register - Set filter init mode
+  CAN3->FMR |= CAN_FMR_FINIT;
 
-    // filter FIFO assignment register - Set all filters to store in FIFO 0
-    CAN->FFA1R = 0x00000000; // Reset value
+  // filter mode register - Set all filter banks to mask mode
+  CAN3->FM1R = 0x00000000; // Reset value
 
-    // filter activation register - CAN_FA1R_FACTX bit activate the associated filter bank
-    CAN->FA1R = 0x00000000; // Reset value
-    CAN->FA1R |= CAN_FA1R_FACT0;
+  // filter scale register - Set all filter banks to be dual 16-bit (vs 32 bit)
+  CAN1->FS1R = 0x00000000; // Reset value (all 16 bit mode)
+  CAN1->FS1R = CAN_FS1R_FSC; // Set all filter banks to 32 bit mode
 
-    // Filter bank registers - A mask of 0 accepts all message IDs and stores in the associated FIFO
-    CAN->sFilterRegister[0].FR1 = 0;
-    CAN->sFilterRegister[0].FR2 = 0;
- 
-    CAN->FMR &= ~(CAN_FMR_FINIT);
-  }
+  // filter FIFO assignment register - Set all filters to store in FIFO 0
+  CAN3->FFA1R = 0x00000000; // Reset value
 
+  // filter activation register - CAN_FA1R_FACTX bit activate the associated filter bank
+  CAN3->FA1R = 0x00000000; // Reset value
+  CAN3->FA1R |= CAN_FA1R_FACT0;
+
+  // Filter bank registers - A mask of 0 accepts all message IDs and stores in the associated FIFO
+  CAN3->sFilterRegister[0].FR1 = 0;
+  CAN3->sFilterRegister[0].FR2 = 0;
+
+  CAN3->FMR &= ~(CAN_FMR_FINIT);
 
   // enable certain CAN interrupts
-  CAN->IER |= CAN_IER_TMEIE | CAN_IER_FMPIE0;
-  //NVIC_EnableIRQ(CAN_IER_TMEIE);
-  switch (can_number) {
-    case 0:
-      NVIC_EnableIRQ(CAN1_TX_IRQn);
-      NVIC_EnableIRQ(CAN1_RX0_IRQn);
-      NVIC_EnableIRQ(CAN1_SCE_IRQn);
-      break;
-    case 1:
-      NVIC_EnableIRQ(CAN2_TX_IRQn);
-      NVIC_EnableIRQ(CAN2_RX0_IRQn);
-      NVIC_EnableIRQ(CAN2_SCE_IRQn);
-      break;
-    case 2:
-      NVIC_EnableIRQ(CAN3_TX_IRQn);
-      NVIC_EnableIRQ(CAN3_RX0_IRQn);
-      NVIC_EnableIRQ(CAN3_SCE_IRQn);
-      break;
-  }
+  CAN1->IER |= CAN_IER_TMEIE | CAN_IER_FMPIE0;
+  CAN2->IER |= CAN_IER_TMEIE | CAN_IER_FMPIE0;
+  CAN3->IER |= CAN_IER_TMEIE | CAN_IER_FMPIE0;
+
+  NVIC_EnableIRQ(CAN1_TX_IRQn);
+  NVIC_EnableIRQ(CAN1_RX0_IRQn);
+  NVIC_EnableIRQ(CAN1_SCE_IRQn);
+  NVIC_EnableIRQ(CAN2_TX_IRQn);
+  NVIC_EnableIRQ(CAN2_RX0_IRQn);
+  NVIC_EnableIRQ(CAN2_SCE_IRQn);
+  NVIC_EnableIRQ(CAN3_TX_IRQn);
+  NVIC_EnableIRQ(CAN3_RX0_IRQn);
+  NVIC_EnableIRQ(CAN3_SCE_IRQn);
+
+  set_can_enable(CAN1, 1);
+  set_can_enable(CAN2, 1);
+  set_can_enable(CAN3, 1);
+  can_set_speed(0);
+  can_set_speed(1);
+  can_set_speed(2);
 
   // in case there are queued up messages
-  //process_can(can_number);
+  process_can(0);
+  process_can(1);
+  process_can(2);
 }
 
 int can_overflow_cnt = 0;
@@ -278,105 +330,6 @@ int can_push(can_ring *q, CAN_FIFOMailBox_TypeDef *elem) {
     #endif
   }
   return ret;
-}
-
-void process_can(uint8_t can_number) {
-  if (can_number != 0xff) {
-
-    enter_critical_section();
-
-    CAN_TypeDef *CAN = CANIF_FROM_CAN_NUM(can_number);
-    uint8_t bus_number = BUS_NUM_FROM_CAN_NUM(can_number);
-
-    // check for empty mailbox
-    CAN_FIFOMailBox_TypeDef to_send;
-    if ((CAN->TSR & CAN_TSR_TME0) == CAN_TSR_TME0) {
-      // add successfully transmitted message to my fifo
-      if ((CAN->TSR & CAN_TSR_RQCP0) == CAN_TSR_RQCP0) {
-        if ((CAN->TSR & CAN_TSR_TERR0) == CAN_TSR_TERR0) {
-          #ifdef DEBUG
-            puts("CAN TX ERROR!\n");
-          #endif
-        }
-
-        if ((CAN->TSR & CAN_TSR_ALST0) == CAN_TSR_ALST0) {
-          #ifdef DEBUG
-            puts("CAN TX ARBITRATION LOST!\n");
-          #endif
-        }
-
-        // clear interrupt
-        // careful, this can also be cleared by requesting a transmission
-        CAN->TSR |= CAN_TSR_RQCP0;
-      }
-
-      if (can_pop(can_queues[bus_number], &to_send)) {
-        // only send if we have received a packet
-        CAN->sTxMailBox[0].TDLR = to_send.RDLR;
-        CAN->sTxMailBox[0].TDHR = to_send.RDHR;
-        CAN->sTxMailBox[0].TDTR = to_send.RDTR;
-        CAN->sTxMailBox[0].TIR = to_send.RIR;
-
-	if (can_number == 0) {
-          can0_tx_cnt++;
-        }
-        if (can_number == 2) {
-          can2_tx_cnt++;
-        }
-      }
-    }
-
-    exit_critical_section();
-  }
-}
-
-void can_init_all() {
-  for (int i=0; i < CAN_MAX; i++) {
-    can_init(i);
-  }
-}
-
-// single wire (low speed) GMLAN only used for button presses to change mode in the future
-void can_set_gmlan(int bus) {
-  if (bus == -1 || bus != can_num_lookup[3]) {
-    // GMLAN OFF
-    switch (can_num_lookup[3]) {
-      case 1:
-        puts("disable GMLAN on CAN2\n");
-        set_can_mode(1, 0);
-        bus_lookup[1] = 1;
-        can_num_lookup[1] = 1;
-        can_num_lookup[3] = -1;
-        can_init(1);
-        break;
-      case 2:
-        puts("disable GMLAN on CAN3\n");
-        set_can_mode(2, 0);
-        bus_lookup[2] = 2;
-        can_num_lookup[2] = 2;
-        can_num_lookup[3] = -1;
-        can_init(2);
-        break;
-    }
-  }
-
-  if (bus == 1) {
-    puts("GMLAN on CAN2\n");
-    // GMLAN on CAN2
-    set_can_mode(1, 1);
-    bus_lookup[1] = 3;
-    can_num_lookup[1] = -1;
-    can_num_lookup[3] = 1;
-    can_init(1);
-  } else if (bus == 2 && revision == PANDA_REV_C) {
-    puts("GMLAN on CAN3\n");
-    // GMLAN on CAN3
-    set_can_mode(2, 1);
-    bus_lookup[2] = 3;
-    can_num_lookup[2] = -1;
-    can_num_lookup[3] = 2;
-    can_init(2);
-  }
 }
 
 // CAN error
@@ -427,7 +380,7 @@ void TIM3_IRQHandler(void) {
     
     tick++;
     if (tick % 1 == 0) {
-        send_interceptor_status();
+      send_interceptor_status();
     }
 
   }
@@ -436,17 +389,17 @@ void TIM3_IRQHandler(void) {
 void send_interceptor_status() {
     CAN_FIFOMailBox_TypeDef status;
 
-    status.RIR = (885 << 21) | 1;
+    status.RIR = (0x376 << 21) | 1;
     status.RDTR = 2;
     status.RDLR = 0x01020304;
     status.RDHR = 0x05060708;
 
-    can_push(can_queues[0], &status);
-    process_can(CAN_NUM_FROM_BUS_NUM(0));
+    can_push(can_queues[1], &status);
+    process_can(CAN_NUM_FROM_BUS_NUM(1));
 }
 
 void handle_update_brake_override(CAN_FIFOMailBox_TypeDef *override_msg) {
-  brake_override.RIR = (789 << 21) | (override_msg->RIR & 0x1FFFFFU);
+  brake_override.RIR = override_msg->RIR
   brake_override.RDTR = override_msg->RDTR;
   brake_override.RDLR = override_msg->RDLR;
   brake_override.RDHR = override_msg->RDHR;
@@ -480,18 +433,13 @@ int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
 
   // CAR to ASCM
   if (bus_num == 0) {
-    // brake proxy
-    if (addr == 788) {
-      handle_update_brake_override(to_fwd);
-      return -1;
-    }
     return 2;
   }
 
-  // CAR to ASCM Obj
+  // Obj
   if (bus_num == 1) {
     // brake proxy
-    if (addr == 788) {
+    if (addr == 0x315) {
       handle_update_brake_override(to_fwd);
     }
     return -1;
@@ -500,7 +448,7 @@ int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
   // ASCM to CAR
   if (bus_num == 2) {
     // brake messages
-    if (addr == 789) {
+    if (addr == 0x315) {
 	if (brake_override_ttl > 0) {
           uint32_t curr_rolling_counter = (to_fwd->RDHR & 0x3U);
 	  if (handle_update_brake_override_rolling_counter(curr_rolling_counter)) {
@@ -521,12 +469,14 @@ int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
 // CAN receive handlers
 // blink blue when we are receiving CAN messages
 void can_rx(uint8_t can_number) {
-  //enter_critical_section();
   CAN_TypeDef *CAN = CANIF_FROM_CAN_NUM(can_number);
   uint8_t bus_number = BUS_NUM_FROM_CAN_NUM(can_number);
   while (CAN->RF0R & CAN_RF0R_FMP0) {
     if (can_number == 0) {
       can0_rx_cnt++;
+    }
+    if (can_number == 1) {
+      can1_rx_cnt++;
     }
     if (can_number == 2) {
       can2_rx_cnt++;
@@ -553,7 +503,6 @@ void can_rx(uint8_t can_number) {
     // next
     CAN->RF0R |= CAN_RF0R_RFOM0;
   }
-  //exit_critical_section();
 }
 
 void CAN1_TX_IRQHandler(void) { process_can(0); }

@@ -230,6 +230,8 @@ int main() {
       //puts("cnt: "); puth(cnt);
       puts(" rx0: "); puth(can0_rx_cnt);
       puts(" tx0: "); puth(can0_tx_cnt);
+      puts(" rx1: "); puth(can1_rx_cnt);
+      puts(" tx1: "); puth(can1_tx_cnt);
       puts(" rx2: "); puth(can2_rx_cnt);
       puts(" tx2: "); puth(can2_tx_cnt);
 
@@ -251,6 +253,21 @@ int main() {
       puts(" ESR:");
       puth(CANZERO->ESR);
       puts("\n");
+
+      CAN_TypeDef *CANONE = CANIF_FROM_CAN_NUM(1);
+      puts("CAN2:  ");
+      puts("MSR:");
+      puth(CANONE->MSR);
+      puts(" TSR:");
+      puth(CANONE->TSR);
+      puts(" RF0R:");
+      puth(CANONE->RF0R);
+      puts(" RF1R:");
+      puth(CANONE->RF1R);
+      puts(" ESR:");
+      puth(CANONE->ESR);
+      puts("\n");
+
 
       CAN_TypeDef *CANTWO = CANIF_FROM_CAN_NUM(2);
       puts("CAN3:  ");
