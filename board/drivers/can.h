@@ -27,9 +27,9 @@ chassis: 0x170: electronic brake control module
 chassis: 0x1E5: steering angle sensor
 chassis: 0xC0: Seems to be needed for auto highbeams
 
-powertrain proxy 0x17F lkasteeringcmd proxy
-powertrain proxy 0x2CA gas regen proxy
-powertrain proxy 0x36F ASCMActiveCruiseControlStatus proxy
+object: 0x180 lkasteeringcmd proxy
+object: 0x2CB gas regen proxy
+object: 0x370 ASCMActiveCruiseControlStatus proxy
 */
 
 #define MIN(a,b) \
@@ -361,9 +361,6 @@ void can_init_all() {
   while(((CAN2->MSR & CAN_MSR_INAK) == CAN_MSR_INAK)) {}
   while(((CAN3->MSR & CAN_MSR_INAK) == CAN_MSR_INAK)) {}
 
-  // no mask
-  //CAN->FS1R|=CAN_FS1R_FSC0;
-
   // filter master register - Set filter init mode
   CAN1->FMR |= CAN_FMR_FINIT;
 
@@ -372,7 +369,7 @@ void can_init_all() {
  
   // filter mode register - CAN_FM1R_FBMX bit sets the associated filter bank to list mode. Only message IDs listed will be pushed to the rx fifo (vs ID mask mode)
   CAN1->FM1R = 0x00000000; // FM1R reset value
-  CAN1->FM1R |= CAN_FM1R_FBM0 | CAN_FM1R_FBM1 | CAN_FM1R_FBM2 | CAN_FM1R_FBM3 | CAN_FM1R_FBM4 | CAN_FM1R_FBM5 | CAN_FM1R_FBM6 | CAN_FM1R_FBM7 | CAN_FM1R_FBM8 | CAN_FM1R_FBM9 | CAN_FM1R_FBM14 | CAN_FM1R_FBM15;
+  CAN1->FM1R |= CAN_FM1R_FBM0 | CAN_FM1R_FBM1 | CAN_FM1R_FBM2 | CAN_FM1R_FBM3 | CAN_FM1R_FBM4 | CAN_FM1R_FBM5 | CAN_FM1R_FBM6 | CAN_FM1R_FBM7 | CAN_FM1R_FBM8 | CAN_FM1R_FBM14 | CAN_FM1R_FBM15;
   
   // filter scale register - Set all filter banks to be 32-bit (vs dual 16 bit)
   CAN1->FS1R = 0x00000000; // Reset value
@@ -383,7 +380,7 @@ void can_init_all() {
   // filter activation register - CAN_FA1R_FACTX bit activate the associated filter bank
   CAN1->FA1R = 0x00000000; // Reset value
 
-  CAN1->FA1R |= CAN_FA1R_FACT0 | CAN_FA1R_FACT1 | CAN_FA1R_FACT2 | CAN_FA1R_FACT3 | CAN_FA1R_FACT4 | CAN_FA1R_FACT5 | CAN_FA1R_FACT6 | CAN_FA1R_FACT7 | CAN_FA1R_FACT8 | CAN_FA1R_FACT9 | CAN_FA1R_FACT14 | CAN_FA1R_FACT15;
+  CAN1->FA1R |= CAN_FA1R_FACT0 | CAN_FA1R_FACT1 | CAN_FA1R_FACT2 | CAN_FA1R_FACT3 | CAN_FA1R_FACT4 | CAN_FA1R_FACT5 | CAN_FA1R_FACT6 | CAN_FA1R_FACT7 | CAN_FA1R_FACT8 | CAN_FA1R_FACT14 | CAN_FA1R_FACT15;
 
   //Set CAN 1 Filters CAR PT
   CAN1->sFilterRegister[0].FR1 = 0x24B<<21;
@@ -403,27 +400,15 @@ void can_init_all() {
   CAN1->sFilterRegister[7].FR1 = 0x1F1<<21;
   CAN1->sFilterRegister[7].FR2 = 0x140<<21;
   CAN1->sFilterRegister[8].FR1 = 0x17D<<21;
-
-  CAN1->sFilterRegister[8].FR2 = 0x2CA<<21;
-  CAN1->sFilterRegister[9].FR1 = 0x17F<<21;
-  CAN1->sFilterRegister[9].FR2 = 0x36F<<21;
+  CAN1->sFilterRegister[8].FR2 = 0x17D<<21;
 
   // Set Can 2 Filters
-/*
-  CAN1->sFilterRegister[14].FR1 = 0;
-  CAN1->sFilterRegister[14].FR2 = 0;
-  CAN1->sFilterRegister[15].FR1 = 0;
-  CAN1->sFilterRegister[15].FR2 = 0;
-*/
-
-  CAN1->sFilterRegister[14].FR1 = 0x17F<<21;
-  CAN1->sFilterRegister[14].FR2 = 0x2CA<<21;
-  CAN1->sFilterRegister[15].FR1 = 0x36F<<21;
-  CAN1->sFilterRegister[15].FR2 = 0x36F<<21;
-
+  CAN1->sFilterRegister[14].FR1 = 0x180<<21;
+  CAN1->sFilterRegister[14].FR2 = 0x2CB<<21;
+  CAN1->sFilterRegister[15].FR1 = 0x370<<21;
+  CAN1->sFilterRegister[15].FR2 = 0x370<<21;
 
   CAN1->FMR &= ~(CAN_FMR_FINIT);
-
 
   // filter master register - Set filter init mode
   CAN3->FMR |= CAN_FMR_FINIT;
@@ -602,7 +587,7 @@ void send_interceptor_status() {
 
 void send_steering_msg(uint32_t tick) {
     CAN_FIFOMailBox_TypeDef steer;
-    steer.RIR = (384 << 21) | 1;
+    steer.RIR = (0x180 << 21) | 1;
 
     if (steering_override_ttl > 0) {
     	steer.RDTR = steering_override.RDTR;
@@ -680,7 +665,6 @@ void send_steering_msg(uint32_t tick) {
 }
 
 void handle_update_steering_override(CAN_FIFOMailBox_TypeDef *override_msg) {
-    steering_override.RIR = (384 << 21) | (override_msg->RIR & 0x1FFFFFU);
     steering_override.RDTR = override_msg->RDTR;
     steering_override.RDLR = override_msg->RDLR;
     steering_override.RDHR = override_msg->RDHR;
@@ -698,7 +682,6 @@ void handle_update_steering_oem(CAN_FIFOMailBox_TypeDef *oem_msg) {
 }
 
 void handle_update_gasregencmd_override(CAN_FIFOMailBox_TypeDef *override_msg) {
-    gas_regen_override.RIR = (715 << 21) | (override_msg->RIR & 0x1FFFFFU);
     gas_regen_override.RDTR = override_msg->RDTR;
     gas_regen_override.RDLR = override_msg->RDLR;
     gas_regen_override.RDHR = override_msg->RDHR;
@@ -724,7 +707,6 @@ bool handle_update_gasregencmd_override_rolling_counter(uint32_t rolling_counter
 }
 
 void handle_update_acc_status_override(CAN_FIFOMailBox_TypeDef *override_msg) {
-  acc_status_override.RIR = (880 << 21) | (override_msg->RIR & 0x1FFFFFU);
   acc_status_override.RDTR = override_msg->RDTR;
   acc_status_override.RDLR = override_msg->RDLR;
   acc_status_override.RDHR = override_msg->RDHR;
@@ -737,56 +719,21 @@ int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
   
   // CAR to ASCM
   if (bus_num == 0) {
-    // 383 == lkasteeringcmd proxy
-    if (addr == 383) {
-      handle_update_steering_override(to_fwd);
-      return -1;
-    }
-    // Get driver applied torque for safety check and then forward to ASCM
-    //if (addr == 388) {
-    //  int torque_driver_new = ((GET_BYTE(to_fwd, 6) & 0x7) << 8) | GET_BYTE(to_fwd, 7);
-    //  torque_driver_new = to_signed(torque_driver_new, 11);
-    //  // update array of samples
-    //  update_sample(&gm_torque_driver, torque_driver_new);
-    //  return 2;
-    //}
-    // 714 == gasregencmd proxy
-    if (addr == 714) {
-      handle_update_gasregencmd_override(to_fwd);
-      return -1;
-    }
-    // 879 == ASCMActiveCruiseControlStatus proxy
-    if (addr == 879) {
-      handle_update_acc_status_override(to_fwd);
-      return -1;
-    }
-    // BCM Button
-    //if (addr == 481) {
-      //uint8_t button_message_counter = to_fwd->RDHR & 0x000003;
-      //to_fwd->RDHR = UNPRESS_MSG[button_message_counter];
-    //}
     return 2;
   }
 
-  // CAR to ASCM OBJ
+  // OBJ
   if (bus_num == 1) {
-    // 383 == lkasteeringcmd proxy
-    if (addr == 383) {
+    // 0x180 == lkasteeringcmd proxy
+    if (addr == 0x180) {
       handle_update_steering_override(to_fwd);
     }
-    // Get driver applied torque for safety check and then forward to ASCM
-    //if (addr == 388) {
-    //  int torque_driver_new = ((GET_BYTE(to_fwd, 6) & 0x7) << 8) | GET_BYTE(to_fwd, 7);
-    //  torque_driver_new = to_signed(torque_driver_new, 11);
-    //  // update array of samples
-    //  update_sample(&gm_torque_driver, torque_driver_new);
-    //}
-    // 714 == gasregencmd proxy
-    if (addr == 714) {
+    // 0x2CB == gasregencmd proxy
+    if (addr == 0x2CB) {
       handle_update_gasregencmd_override(to_fwd);
     }
-    // 879 == ASCMActiveCruiseControlStatus proxy
-    if (addr == 879) {
+    // 0x370 == ASCMActiveCruiseControlStatus proxy
+    if (addr == 0x370) {
       handle_update_acc_status_override(to_fwd);
     }
     return -1;
@@ -794,14 +741,14 @@ int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
 
   // ASCM to CAR
   if (bus_num == 2) {
-    // 384 == lkasteeringcmd : Only update, steering is more complex because it cycles between 10 Hz and 50 Hz
+    // 0x180 == lkasteeringcmd : Only update, steering is more complex because it cycles between 10 Hz and 50 Hz
     // so this interceptor needs to be the heartbeat
-    if (addr == 384) {
+    if (addr == 0x180) {
       handle_update_steering_oem(to_fwd);
       return -1;
     }
-    // 715 == gasregencmd
-    if (addr == 715) {
+    // 0x2CB == gasregencmd
+    if (addr == 0x2CB) {
       if (gas_regen_override_ttl > 0) {
 	uint32_t curr_rolling_counter = (to_fwd->RDLR & 0xC0U) >> 6;
 	if (handle_update_gasregencmd_override_rolling_counter(curr_rolling_counter)) {
@@ -813,8 +760,8 @@ int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
       }
       return 0;
     }
-    // 880 == ASCMActiveCruiseControlStatus
-    if (addr == 880) {
+    // 0x370 == ASCMActiveCruiseControlStatus
+    if (addr == 0x370) {
       ascm_acc_cmd_active = (to_fwd->RDLR >> 23) & 1U;
       if (acc_status_ttl > 0) {
         to_fwd->RIR = acc_status_override.RIR;
@@ -834,7 +781,6 @@ int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
 // CAN receive handlers
 // blink blue when we are receiving CAN messages
 void can_rx(uint8_t can_number) {
-  //enter_critical_section();
   CAN_TypeDef *CAN = CANIF_FROM_CAN_NUM(can_number);
   uint8_t bus_number = BUS_NUM_FROM_CAN_NUM(can_number);
   while (CAN->RF0R & CAN_RF0R_FMP0) {
@@ -868,7 +814,6 @@ void can_rx(uint8_t can_number) {
     // next
     CAN->RF0R |= CAN_RF0R_RFOM0;
   }
-  //exit_critical_section();
 }
 
 void CAN1_TX_IRQHandler(void) { process_can(0); }

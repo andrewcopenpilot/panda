@@ -13,7 +13,6 @@
 #include "gpio.h"
 
 #include "drivers/uart.h"
-#include "drivers/adc.h"
 #include "drivers/usb.h"
 #include "drivers/can.h"
 #include "drivers/timer.h"
@@ -203,8 +202,6 @@ int main() {
   set_esp_mode(ESP_DISABLED);
 
   can_init_all();
-
-  adc_init();
 
   puts("**** INTERRUPTS ON ****\n");
 
