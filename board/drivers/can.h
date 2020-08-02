@@ -1,222 +1,31 @@
-/*
-powertrain: 0x24B: Debug messages
-powertrain: 0xF1: body control module
-powertrain: 0xC9: Engine contorl module
-powertrain: 0x1E9: brake control module
-powertrain: 0x1C4: Engine Control Module
-powertrain: 0x1C5: Engine control module
-powertrain: 0x1F5: Telematic control module
-powertrain: 0x1E1: Body Control Module
-powertrain: 0x214: brake control module
-powertrain: 0x230: electronic parking brake
-powertrain: 0x34A: brake control module
-powertrain: 0x12A: body control module
-powertrain: 0x135: body control module
-powertrain: 0x184: power steering control module
-powertrain: 0x1F1: body control module
-powertrain: 0x140: body control module
-
-
-chassis: 0xC1: electronic brake control module
-chassis: 0xC5: electronic brake control module
-chassis: 0x130: multi axis accelerometer
-chassis: 0x140: multi axis accelerometer
-chassis: 0x170: electronic brake control module
-chassis: 0x1E5: steering angle sensor
-chassis: 0xC0: Seems to be needed for auto highbeams
-
-powertrain proxy 0x2CA gas regen proxy
-*/
-
-#define MIN(a,b) \
- ({ __typeof__ (a) _a = (a); \
-     __typeof__ (b) _b = (b); \
-   (_a < _b) ? _a : _b; })
-
-#define MAX(a,b) \
- ({ __typeof__ (a) _a = (a); \
-     __typeof__ (b) _b = (b); \
-   (_a > _b) ? _a : _b; })
-
-#define GET_BUS(msg) (((msg)->RDTR >> 4) & 0xFF)
-
 #define GET_ADDR(msg) ((((msg)->RIR & 4) != 0) ? ((msg)->RIR >> 3) : ((msg)->RIR >> 21))
-#define GET_BYTE(msg, b) (((int)(b) > 3) ? (((msg)->RDHR >> (8U * ((unsigned int)(b) % 4U))) & 0XFFU) : (((msg)->RDLR >> (8U * (unsigned int)(b))) & 0xFFU))
 
 // IRQs: CAN1_TX, CAN1_RX0, CAN1_SCE, CAN2_TX, CAN2_RX0, CAN2_SCE, CAN3_TX, CAN3_RX0, CAN3_SCE
 
-#define CAN_MAX 3
+#define CAN_MAX 2
 
 #define can_buffer(x, size) \
   CAN_FIFOMailBox_TypeDef elems_##x[size]; \
   can_ring can_##x = { .w_ptr = 0, .r_ptr = 0, .fifo_size = size, .elems = (CAN_FIFOMailBox_TypeDef *)&elems_##x };
 
+#define CAN_TRANSMIT 1
+#define CAN_EXTENDED 4
+
 can_buffer(tx1_q, 0x100)
 can_buffer(tx2_q, 0x100)
 can_buffer(tx3_q, 0x100)
-can_buffer(txgmlan_q, 0x100)
-can_ring *can_queues[] = {&can_tx1_q, &can_tx2_q, &can_tx3_q, &can_txgmlan_q};
-
-// params and flags about checksum, counter and frequency checks for each monitored address
-typedef struct {
-  // const params
-  const int addr[3];                 // check either messages (e.g. honda steer). Array MUST terminate with a zero to know its length.
-  const int bus;                     // bus where to expect the addr. Temp hack: -1 means skip the bus check
-  const bool check_checksum;         // true is checksum check is performed
-  const uint8_t max_counter;         // maximum value of the counter. 0 means that the counter check is skipped
-  const uint32_t expected_timestep;  // expected time between message updates [us]
-  // dynamic flags
-  bool valid_checksum;               // true if and only if checksum check is passed
-  int wrong_counters;                // counter of wrong counters, saturated between 0 and MAX_WRONG_COUNTERS
-  uint8_t last_counter;              // last counter value
-  uint32_t last_timestamp;           // micro-s
-  bool lagging;                      // true if and only if the time between updates is excessive
-} AddrCheckStruct;
-
-// sample struct that keeps 3 samples in memory
-struct sample_t {
-  int values[6];
-  int min;
-  int max;
-} sample_t_default = {{0}, 0, 0};
-
-// convert a trimmed integer to signed 32 bit int
-int to_signed(int d, int bits) {
-  int d_signed = d;
-  if (d >= (1 << MAX((bits - 1), 0))) {
-    d_signed = d - (1 << MAX(bits, 0));
-  }
-  return d_signed;
-}
-
-// given a new sample, update the smaple_t struct
-void update_sample(struct sample_t *sample, int sample_new) {
-  int sample_size = sizeof(sample->values) / sizeof(sample->values[0]);
-  for (int i = sample_size - 1; i > 0; i--) {
-    sample->values[i] = sample->values[i-1];
-  }
-  sample->values[0] = sample_new;
-
-  // get the minimum and maximum measured samples
-  sample->min = sample->values[0];
-  sample->max = sample->values[0];
-  for (int i = 1; i < sample_size; i++) {
-    if (sample->values[i] < sample->min) {
-      sample->min = sample->values[i];
-    }
-    if (sample->values[i] > sample->max) {
-      sample->max = sample->values[i];
-    }
-  }
-}
-
-bool max_limit_check(int val, const int MAX_VAL, const int MIN_VAL) {
-  return (val > MAX_VAL) || (val < MIN_VAL);
-}
-
-// real time check, mainly used for steer torque rate limiter
-bool rt_rate_limit_check(int val, int val_last, const int MAX_RT_DELTA) {
-
-  // *** torque real time rate limit check ***
-  int highest_val = MAX(val_last, 0) + MAX_RT_DELTA;
-  int lowest_val = MIN(val_last, 0) - MAX_RT_DELTA;
-
-  // check for violation
-  return (val < lowest_val) || (val > highest_val);
-}
-
-// compute the time elapsed (in microseconds) from 2 counter samples
-// case where ts < ts_last is ok: overflow is properly re-casted into uint32_t
-uint32_t get_ts_elapsed(uint32_t ts, uint32_t ts_last) {
-  return ts - ts_last;
-}
-
-int get_addr_check_index(CAN_FIFOMailBox_TypeDef *to_push, AddrCheckStruct addr_list[], const int len) {
-  int bus = GET_BUS(to_push);
-  int addr = GET_ADDR(to_push);
-
-  int index = -1;
-  for (int i = 0; i < len; i++) {
-    for (uint8_t j = 0U; addr_list[i].addr[j] != 0; j++) {
-      if ((addr == addr_list[i].addr[j]) && (bus == addr_list[i].bus)) {
-        index = i;
-        goto Return;
-      }
-    }
-  }
-Return:
-  return index;
-}
-
-// check that commanded value isn't fighting against driver
-bool driver_limit_check(int val, int val_last, struct sample_t *val_driver,
-  const int MAX_VAL, const int MAX_RATE_UP, const int MAX_RATE_DOWN,
-  const int MAX_ALLOWANCE, const int DRIVER_FACTOR) {
-
-  int highest_allowed_rl = MAX(val_last, 0) + MAX_RATE_UP;
-  int lowest_allowed_rl = MIN(val_last, 0) - MAX_RATE_UP;
-
-  int driver_max_limit = MAX_VAL + (MAX_ALLOWANCE + val_driver->max) * DRIVER_FACTOR;
-  int driver_min_limit = -MAX_VAL + (-MAX_ALLOWANCE + val_driver->min) * DRIVER_FACTOR;
-
-  // if we've exceeded the applied torque, we must start moving toward 0
-  int highest_allowed = MIN(highest_allowed_rl, MAX(val_last - MAX_RATE_DOWN,
-                                             MAX(driver_max_limit, 0)));
-  int lowest_allowed = MAX(lowest_allowed_rl, MIN(val_last + MAX_RATE_DOWN,
-                                           MIN(driver_min_limit, 0)));
-
-  // check for violation
-  return (val < lowest_allowed) || (val > highest_allowed);
-}
-
-const int GM_MAX_STEER = 300;
-const int GM_MAX_RT_DELTA = 128;          // max delta torque allowed for real time checks
-const uint32_t GM_RT_INTERVAL = 250000;    // 250ms between real time checks
-const int GM_MAX_RATE_UP = 7;
-const int GM_MAX_RATE_DOWN = 17;
-const int GM_DRIVER_TORQUE_ALLOWANCE = 50;
-const int GM_DRIVER_TORQUE_FACTOR = 4;
-const int GM_MAX_GAS = 4500;
-const int GM_MAX_REGEN = 1404;
-
-int gm_rt_torque_last = 0;
-int gm_desired_torque_last = 0;
-uint32_t gm_ts_last = 0;
-struct sample_t gm_torque_driver;         // last few driver torques measured
+can_ring *can_queues[] = {&can_tx1_q, &can_tx2_q, &can_tx3_q};
 
 int can_err_cnt = 0;
-int can0_mailbox_full_cnt = 0;
-int can1_mailbox_full_cnt = 0;
 int can0_rx_cnt = 0;
-int can2_rx_cnt = 0;
+int can1_rx_cnt = 0;
 int can0_tx_cnt = 0;
-int can2_tx_cnt = 0;
+int can1_tx_cnt = 0;
 
 uint32_t tick = 0;
-uint8_t ascm_acc_cmd_active = 0;
 
-void can_send(CAN_FIFOMailBox_TypeDef *to_push, uint8_t bus_number);
 bool can_pop(can_ring *q, CAN_FIFOMailBox_TypeDef *elem);
 void send_interceptor_status();
-void send_steering_msg(uint32_t tick);
-
-CAN_FIFOMailBox_TypeDef steering_oem;
-volatile int steering_oem_ttl = 0;
-
-uint8_t steering_violation_cnt = 0;
-
-// overrides
-CAN_FIFOMailBox_TypeDef steering_override;
-volatile int steering_override_ttl = 0;
-volatile uint8_t steering_rolling_counter = 0;
-
-CAN_FIFOMailBox_TypeDef gas_regen_override;
-volatile int gas_regen_override_ttl = 0;
-int gas_regen_counter;
-
-CAN_FIFOMailBox_TypeDef acc_status_override;
-volatile int acc_status_ttl = 0;
-
 
 // assign CAN numbering
 // bus num: Can bus number on ODB connector. Sent to/from USB
@@ -232,7 +41,7 @@ CAN_TypeDef *cans[] = {CAN1, CAN2, CAN3};
 uint8_t bus_lookup[] = {0,1,2};
 uint8_t can_num_lookup[] = {0,1,2,-1};
 int8_t can_forwarding[] = {-1,-1,-1,-1};
-uint32_t can_speed[] = {5000, 5000, 5000, 333};
+uint32_t can_speed[] = {333, 5000, 5000, 333};
 
 #define AUTOBAUD_SPEEDS_LEN (sizeof(can_autobaud_speeds) / sizeof(can_autobaud_speeds[0]))
 
@@ -333,166 +142,14 @@ void process_can(uint8_t can_number) {
 	if (can_number == 0) {
           can0_tx_cnt++;
         }
-        if (can_number == 2) {
-          can2_tx_cnt++;
+        if (can_number == 1) {
+          can1_tx_cnt++;
         }
       }
     }
 
     exit_critical_section();
   }
-}
-
-void can_init(uint8_t can_number) {
-  if (can_number == 0xff) return;
-
-  CAN_TypeDef *CAN = CANIF_FROM_CAN_NUM(can_number);
-  set_can_enable(CAN, 1);
-  can_set_speed(can_number);
-
-  // accept all filter
-  CAN->FMR |= CAN_FMR_FINIT;
-
-  // no mask
-  CAN->FS1R|=CAN_FS1R_FSC0;
-
-  if (can_number == 99) {
-    CAN->sFilterRegister[0].FR1 = 0x24B<<21;
-    CAN->sFilterRegister[0].FR2 = 0xF1<<21;
-    CAN->sFilterRegister[1].FR1 = 0xC9<<21;
-    CAN->sFilterRegister[1].FR2 = 0x1E9<<21;
-    CAN->sFilterRegister[2].FR1 = 0x1C4<<21;
-    CAN->sFilterRegister[2].FR2 = 0x1C5<<21;
-    CAN->sFilterRegister[3].FR1 = 0x1F5<<21;
-    CAN->sFilterRegister[3].FR2 = 0x1E1<<21;
-    CAN->sFilterRegister[4].FR1 = 0x214<<21;
-    CAN->sFilterRegister[4].FR2 = 0x230<<21;
-    CAN->sFilterRegister[5].FR1 = 0x34A<<21;
-    CAN->sFilterRegister[5].FR2 = 0x12A<<21;
-    CAN->sFilterRegister[6].FR1 = 0x135<<21;
-    CAN->sFilterRegister[6].FR2 = 0x184<<21;
-    CAN->sFilterRegister[7].FR1 = 0x1F1<<21;
-    CAN->sFilterRegister[7].FR2 = 0x140<<21;
-    CAN->sFilterRegister[8].FR1 = 0x2CA<<21;
-    CAN->sFilterRegister[8].FR2 = 0x17F<<21;
-    CAN->sFilterRegister[9].FR1 = 0x36F<<21;
-    CAN->sFilterRegister[9].FR1 = 0x36F<<21;
-    CAN->sFilterRegister[14].FR1 = 0;
-    CAN->sFilterRegister[14].FR2 = 0;
-    CAN->FM1R |= CAN_FM1R_FBM0 | CAN_FM1R_FBM1 | CAN_FM1R_FBM2 | CAN_FM1R_FBM3 | CAN_FM1R_FBM4 | CAN_FM1R_FBM5 | CAN_FM1R_FBM6 | CAN_FM1R_FBM7 | CAN_FM1R_FBM8 | CAN_FM1R_FBM9; 
-    CAN->FA1R |= CAN_FA1R_FACT0 | CAN_FA1R_FACT1 | CAN_FA1R_FACT2 | CAN_FA1R_FACT3 | CAN_FA1R_FACT4 | CAN_FA1R_FACT5 | CAN_FA1R_FACT6 | CAN_FA1R_FACT7 | CAN_FA1R_FACT8 | CAN_FA1R_FACT9;
-    CAN->FA1R |= (1 << 14);
-    CAN->FFA1R = 0x00000000;
-  }
-  else {
-    CAN->sFilterRegister[0].FR1 = 0;
-    CAN->sFilterRegister[0].FR2 = 0;
-    CAN->sFilterRegister[14].FR1 = 0;
-    CAN->sFilterRegister[14].FR2 = 0;
-    CAN->FA1R |= 1 | (1 << 14);
-  }
-
-  CAN->FMR &= ~(CAN_FMR_FINIT);
-
-  // enable certain CAN interrupts
-  CAN->IER |= CAN_IER_TMEIE | CAN_IER_FMPIE0;
-  //NVIC_EnableIRQ(CAN_IER_TMEIE);
-  switch (can_number) {
-    case 0:
-      NVIC_EnableIRQ(CAN1_TX_IRQn);
-      NVIC_EnableIRQ(CAN1_RX0_IRQn);
-      NVIC_EnableIRQ(CAN1_SCE_IRQn);
-      break;
-    case 1:
-      NVIC_EnableIRQ(CAN2_TX_IRQn);
-      NVIC_EnableIRQ(CAN2_RX0_IRQn);
-      NVIC_EnableIRQ(CAN2_SCE_IRQn);
-      break;
-    case 2:
-      NVIC_EnableIRQ(CAN3_TX_IRQn);
-      NVIC_EnableIRQ(CAN3_RX0_IRQn);
-      NVIC_EnableIRQ(CAN3_SCE_IRQn);
-      break;
-  }
-
-  // in case there are queued up messages
-  process_can(can_number);
-}
-
-void can_init_hw(uint8_t can_number) {
-  if (can_number == 0xff) return;
-
-  CAN_TypeDef *CAN = CANIF_FROM_CAN_NUM(can_number);
-  set_can_enable(CAN, 1);
-  can_set_speed(can_number);
-
-  // accept all filter
-  CAN->FMR |= CAN_FMR_FINIT;
-
-  // no mask
-  CAN->FS1R|=CAN_FS1R_FSC0;
-
-  if (can_number == 0) {
-    CAN->sFilterRegister[0].FR1 = 0x24B<<21;
-    CAN->sFilterRegister[0].FR2 = 0xF1<<21;
-    CAN->sFilterRegister[1].FR1 = 0xC9<<21;
-    CAN->sFilterRegister[1].FR2 = 0x1E9<<21;
-    CAN->sFilterRegister[2].FR1 = 0x1C4<<21;
-    CAN->sFilterRegister[2].FR2 = 0x1C5<<21;
-    CAN->sFilterRegister[3].FR1 = 0x1F5<<21;
-    CAN->sFilterRegister[3].FR2 = 0x1E1<<21;
-    CAN->sFilterRegister[4].FR1 = 0x214<<21;
-    CAN->sFilterRegister[4].FR2 = 0x230<<21;
-    CAN->sFilterRegister[5].FR1 = 0x34A<<21;
-    CAN->sFilterRegister[5].FR2 = 0x12A<<21;
-    CAN->sFilterRegister[6].FR1 = 0x135<<21;
-    CAN->sFilterRegister[6].FR2 = 0x184<<21;
-    CAN->sFilterRegister[7].FR1 = 0x1F1<<21;
-    CAN->sFilterRegister[7].FR2 = 0x140<<21;
-    CAN->sFilterRegister[8].FR1 = 0x2CA<<21;
-    CAN->sFilterRegister[8].FR2 = 0x17F<<21;
-    CAN->sFilterRegister[9].FR1 = 0x36F<<21;
-    CAN->sFilterRegister[9].FR1 = 0x36F<<21;
-    CAN->sFilterRegister[14].FR1 = 0;
-    CAN->sFilterRegister[14].FR2 = 0;
-    CAN->FM1R |= CAN_FM1R_FBM0 | CAN_FM1R_FBM1 | CAN_FM1R_FBM2 | CAN_FM1R_FBM3 | CAN_FM1R_FBM4 | CAN_FM1R_FBM5 | CAN_FM1R_FBM6 | CAN_FM1R_FBM7 | CAN_FM1R_FBM8 | CAN_FM1R_FBM9; 
-    CAN->FA1R |= CAN_FA1R_FACT0 | CAN_FA1R_FACT1 | CAN_FA1R_FACT2 | CAN_FA1R_FACT3 | CAN_FA1R_FACT4 | CAN_FA1R_FACT5 | CAN_FA1R_FACT6 | CAN_FA1R_FACT7 | CAN_FA1R_FACT8 | CAN_FA1R_FACT9;
-    CAN->FA1R |= (1 << 14);
-    CAN->FFA1R = 0x00000000;
-  }
-  else {
-    CAN->sFilterRegister[0].FR1 = 0;
-    CAN->sFilterRegister[0].FR2 = 0;
-    CAN->sFilterRegister[14].FR1 = 0;
-    CAN->sFilterRegister[14].FR2 = 0;
-    CAN->FA1R |= 1 | (1 << 14);
-  }
-
-  CAN->FMR &= ~(CAN_FMR_FINIT);
-
-  // enable certain CAN interrupts
-  CAN->IER |= CAN_IER_TMEIE | CAN_IER_FMPIE0;
-  //NVIC_EnableIRQ(CAN_IER_TMEIE);
-  switch (can_number) {
-    case 0:
-      NVIC_EnableIRQ(CAN1_TX_IRQn);
-      NVIC_EnableIRQ(CAN1_RX0_IRQn);
-      NVIC_EnableIRQ(CAN1_SCE_IRQn);
-      break;
-    case 1:
-      NVIC_EnableIRQ(CAN2_TX_IRQn);
-      NVIC_EnableIRQ(CAN2_RX0_IRQn);
-      NVIC_EnableIRQ(CAN2_SCE_IRQn);
-      break;
-    case 2:
-      NVIC_EnableIRQ(CAN3_TX_IRQn);
-      NVIC_EnableIRQ(CAN3_RX0_IRQn);
-      NVIC_EnableIRQ(CAN3_SCE_IRQn);
-      break;
-  }
-
-  // in case there are queued up messages
-  process_can(can_number);
 }
 
 int can_overflow_cnt = 0;
@@ -536,54 +193,64 @@ int can_push(can_ring *q, CAN_FIFOMailBox_TypeDef *elem) {
   return ret;
 }
 
-
 void can_init_all() {
-  for (int i=0; i < CAN_MAX; i++) {
-    can_init(i);
-  }
-}
+  // Wait for INAK bit to be set
+  while(((CAN1->MSR & CAN_MSR_INAK) == CAN_MSR_INAK)) {}
+  while(((CAN2->MSR & CAN_MSR_INAK) == CAN_MSR_INAK)) {}
 
-// single wire (low speed) GMLAN only used for button presses to change mode in the future
-void can_set_gmlan(int bus) {
-  if (bus == -1 || bus != can_num_lookup[3]) {
-    // GMLAN OFF
-    switch (can_num_lookup[3]) {
-      case 1:
-        puts("disable GMLAN on CAN2\n");
-        set_can_mode(1, 0);
-        bus_lookup[1] = 1;
-        can_num_lookup[1] = 1;
-        can_num_lookup[3] = -1;
-        can_init(1);
-        break;
-      case 2:
-        puts("disable GMLAN on CAN3\n");
-        set_can_mode(2, 0);
-        bus_lookup[2] = 2;
-        can_num_lookup[2] = 2;
-        can_num_lookup[3] = -1;
-        can_init(2);
-        break;
-    }
-  }
+  // filter master register - Set filter init mode
+  CAN1->FMR |= CAN_FMR_FINIT;
 
-  if (bus == 1) {
-    puts("GMLAN on CAN2\n");
-    // GMLAN on CAN2
-    set_can_mode(1, 1);
-    bus_lookup[1] = 3;
-    can_num_lookup[1] = -1;
-    can_num_lookup[3] = 1;
-    can_init(1);
-  } else if (bus == 2 && revision == PANDA_REV_C) {
-    puts("GMLAN on CAN3\n");
-    // GMLAN on CAN3
-    set_can_mode(2, 1);
-    bus_lookup[2] = 3;
-    can_num_lookup[2] = -1;
-    can_num_lookup[3] = 2;
-    can_init(2);
-  }
+  // Assign 14 filter banks to CAN 1 and 2 each
+  CAN1->FMR |= (((uint32_t) 14) << CAN_FMR_CAN2SB_Pos) & CAN_FMR_CAN2SB_Msk;
+
+  // filter mode register - CAN_FM1R_FBMX bit sets the associated filter bank to list mode. Only message IDs listed will be pushed to the rx fifo (vs ID mask mode)
+  CAN1->FM1R = 0x00000000; // FM1R reset value
+  CAN1->FM1R |= CAN_FM1R_FBM0 | CAN_FM1R_FBM14 | CAN_FA1R_FACT15;
+
+  // filter scale register - Set all filter banks to be dual 16-bit (vs 32 bit)
+  CAN1->FS1R = 0x00000000; // Reset value (all 16 bit mode)
+  CAN1->FS1R = CAN_FS1R_FSC; // Set all filter banks to 32 bit mode
+
+  // filter FIFO assignment register - Set all filters to store in FIFO 0
+  CAN1->FFA1R = 0x00000000;
+
+  // filter activation register - CAN_FA1R_FACTX bit activate the associated filter bank
+  CAN1->FA1R = 0x00000000; // Reset value
+  CAN1->FA1R |= CAN_FA1R_FACT0 | CAN_FA1R_FACT14 | CAN_FA1R_FACT15;
+
+  //Set CAN 1 Filters SW GMLAN
+  CAN1->sFilterRegister[0].FR1 = 0;
+  CAN1->sFilterRegister[0].FR2 = 0;
+
+
+  // Set Can 2 Filters Object
+  CAN1->sFilterRegister[14].FR1 = (0x104c006c<<3) | CAN_EXTENDED; // Openpilot lka icon
+  CAN1->sFilterRegister[14].FR2 = 885 << 21; // PT Interceptor status
+  CAN1->sFilterRegister[15].FR1 = 886 << 21; // Chas Interceptor status
+  CAN1->sFilterRegister[15].FR2 = 0;
+
+  CAN1->FMR &= ~(CAN_FMR_FINIT);
+
+  // enable certain CAN interrupts
+  CAN1->IER |= CAN_IER_TMEIE | CAN_IER_FMPIE0;
+  CAN2->IER |= CAN_IER_TMEIE | CAN_IER_FMPIE0;
+
+  NVIC_EnableIRQ(CAN1_TX_IRQn);
+  NVIC_EnableIRQ(CAN1_RX0_IRQn);
+  NVIC_EnableIRQ(CAN1_SCE_IRQn);
+  NVIC_EnableIRQ(CAN2_TX_IRQn);
+  NVIC_EnableIRQ(CAN2_RX0_IRQn);
+  NVIC_EnableIRQ(CAN2_SCE_IRQn);
+
+  set_can_enable(CAN1, 1);
+  set_can_enable(CAN2, 1);
+  can_set_speed(0);
+  can_set_speed(1);
+
+  // in case there are queued up messages
+  process_can(0);
+  process_can(1);
 }
 
 // CAN error
@@ -628,267 +295,55 @@ void TIM3_IRQHandler(void)
 if (TIM3->SR & TIM_SR_UIF) // if UIF flag is set
   {
     TIM3->SR &= ~TIM_SR_UIF; // clear UIF flag
-    enter_critical_section();
-    if (steering_oem_ttl > 0) {
-        steering_oem_ttl--;
-    }
-    if (steering_override_ttl > 0) {
-        steering_override_ttl--;
-    }
-    if (gas_regen_override_ttl > 0) {
-        gas_regen_override_ttl--;
-    }
-    if (acc_status_ttl > 0) {
-        acc_status_ttl--;
-    }
-    exit_critical_section();
-
     tick++;
     if (tick % 5 == 0) {
         send_interceptor_status();
     }
-    send_steering_msg(tick);
   }
 }
 
 // ***************************** CAN *****************************
 
-int RESUME_MSG[4] = {0xBF2C00, 0xEE2101, 0xDD2602, 0xCC2B03};
-int UNPRESS_MSG[4] = {0xFF1000, 0xEE1501, 0xDD1A02, 0xCC1F03};
-int CRUISE_MAIN_MSG[4] = {0xBF5000, 0xAE5501, 0x9D5A02, 0x8C5F03};
+int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
+  int addr = GET_ADDR(to_fwd);
+
+  // SW GMLAN
+  if (bus_num == 0) {
+    //Nothing proxied in this direction yet
+  }
+
+  // Obj
+  if (bus_num == 1) {
+    // lka icon
+    if (addr == 0x104c006c) {
+      return 0;
+    }
+  }
+  return -1;
+}
 
 void send_interceptor_status() {
     CAN_FIFOMailBox_TypeDef status;
 
-    status.RIR = (885 << 21) | 1;
+    status.RIR = (887 << 21) | 1;
     status.RDTR = 8;
-    status.RDLR = 0;
-    status.RDLR |= ascm_acc_cmd_active;
-    status.RDHR = 0xFFFFFFFF | steering_violation_cnt;
+    status.RDLR = 0x01020304;
+    status.RDHR = 0x05060708;
 
-    can_push(can_queues[0], &status);
-    process_can(CAN_NUM_FROM_BUS_NUM(0));
+    can_push(can_queues[1], &status);
+    process_can(CAN_NUM_FROM_BUS_NUM(1));
 }	
 
-void send_steering_msg(uint32_t tick) {
-    CAN_FIFOMailBox_TypeDef steer;
-    steer.RIR = (384 << 21) | 1;
-
-    if (steering_override_ttl > 0) {
-    	steer.RDTR = steering_override.RDTR;
-    	steer.RDLR = steering_override.RDLR;
-    	steer.RDHR = steering_override.RDHR;
-    }
-    else if (steering_oem_ttl > 0) {
-        steer.RDTR = steering_oem.RDTR;
-	steer.RDLR = steering_oem.RDLR;
-	steer.RDHR = steering_oem.RDHR;
-    }
-    else {
-        return;
-    }
-
-    // Only update at 10 Hz when not active
-    uint8_t active = (steer.RDLR >> 3) & 0x1U;
-    if (!active && (tick % 5 != 0))
-        return;
-
-    // Pull out LKA Steering CMD data and swap endianness (not including rolling counter)
-    uint32_t dataswap = ((steer.RDLR << 8) & 0x0F00U) | ((steer.RDLR >> 8) &0xFFU);
-    uint32_t checksum = (0x1000 - dataswap - steering_rolling_counter) & 0x0fff;
-
-    //Swap endianness of checksum back to what GM expects
-    uint32_t checksumswap = (checksum >> 8) | ((checksum << 8) & 0xFF00U);
-
-    // Merge the rewritten checksum back into the BxCAN frame RDLR
-    steer.RDLR = (steer.RDLR & 0x0000FFCF) | (checksumswap << 16) | (steering_rolling_counter << 4);
-
-    steering_rolling_counter++;
-    steering_rolling_counter %= 4;
-
-    // LKA STEER: safety check
-    int desired_torque = ((GET_BYTE(&steer, 0) & 0x7U) << 8) + GET_BYTE(&steer, 1);
-    //uint32_t ts = TIM2->CNT;
-    bool violation = 0;
-    desired_torque = to_signed(desired_torque, 11);
-
-    // *** global torque limit check ***
-    violation |= max_limit_check(desired_torque, GM_MAX_STEER, -GM_MAX_STEER);
-
-    // *** torque rate limit check ***
-    //violation |= driver_limit_check(desired_torque, gm_desired_torque_last, &gm_torque_driver,
-    //  GM_MAX_STEER, GM_MAX_RATE_UP, GM_MAX_RATE_DOWN,
-    //  GM_DRIVER_TORQUE_ALLOWANCE, GM_DRIVER_TORQUE_FACTOR);
-
-    // used next time
-    //gm_desired_torque_last = desired_torque;
-
-    // *** torque real time rate limit check ***
-    //violation |= rt_rate_limit_check(desired_torque, gm_rt_torque_last, GM_MAX_RT_DELTA);
-
-    // every RT_INTERVAL set the new limits
-    //uint32_t ts_elapsed = get_ts_elapsed(ts, gm_ts_last);
-    //if (ts_elapsed > GM_RT_INTERVAL) {
-    //  gm_rt_torque_last = desired_torque;
-    //  gm_ts_last = ts;
-    //}
-    
-    // reset to 0 if there's a violation
-    //if (violation || (desired_torque == 0)) {
-    //  gm_desired_torque_last = 0;
-    //  gm_rt_torque_last = 0;
-    //  gm_ts_last = ts;
-    //}
-
-    if (violation) {
-      steering_violation_cnt++;
-      return;
-    }
-
-    can_push(can_queues[0], &steer);
-    process_can(CAN_NUM_FROM_BUS_NUM(0));
-}
-
-void handle_update_steering_override(CAN_FIFOMailBox_TypeDef *override_msg) {
-    steering_override.RIR = (384 << 21) | (override_msg->RIR & 0x1FFFFFU);
-    steering_override.RDTR = override_msg->RDTR;
-    steering_override.RDLR = override_msg->RDLR;
-    steering_override.RDHR = override_msg->RDHR;
-
-    steering_override_ttl = 50;
-}
-
-void handle_update_steering_oem(CAN_FIFOMailBox_TypeDef *oem_msg) {
-    steering_oem.RIR =  oem_msg->RIR;
-    steering_oem.RDTR = oem_msg->RDTR;
-    steering_oem.RDLR = oem_msg->RDLR;
-    steering_oem.RDHR = oem_msg->RDHR;
-
-    steering_oem_ttl = 50;
-}
-
-void handle_update_gasregencmd_override(CAN_FIFOMailBox_TypeDef *override_msg) {
-    gas_regen_override.RIR = (715 << 21) | (override_msg->RIR & 0x1FFFFFU);
-    gas_regen_override.RDTR = override_msg->RDTR;
-    gas_regen_override.RDLR = override_msg->RDLR;
-    gas_regen_override.RDHR = override_msg->RDHR;
-
-    gas_regen_override_ttl = 50;
-}
-
-
-bool handle_update_gasregencmd_override_rolling_counter(uint32_t rolling_counter) {
-  gas_regen_override.RDLR &= 0xFFFFFF3FU;
-  gas_regen_override.RDLR |= (rolling_counter << 6);
-  uint32_t checksum3 = (0x100U - ((gas_regen_override.RDLR & 0xFF000000U) >> 24) - rolling_counter) & 0xFFU;
-
-  gas_regen_override.RDHR &= 0x00FFFFFFU;
-  gas_regen_override.RDHR = gas_regen_override.RDHR | (checksum3 << 24);
-
-  // GAS/REGEN: safety check - TODO disable system instead of just dropping out of saftey range messages
-  int gas_regen = ((GET_BYTE(&gas_regen_override, 2) & 0x7FU) << 5) + ((GET_BYTE(&gas_regen_override, 3) & 0xF8U) >> 3);
-  if (gas_regen > GM_MAX_GAS) {
-    return false;
-  }
-  return true;
-}
-
-void handle_update_acc_status_override(CAN_FIFOMailBox_TypeDef *override_msg) {
-  acc_status_override.RIR = (880 << 21) | (override_msg->RIR & 0x1FFFFFU);
-  acc_status_override.RDTR = override_msg->RDTR;
-  acc_status_override.RDLR = override_msg->RDLR;
-  acc_status_override.RDHR = override_msg->RDHR;
-
-  acc_status_ttl = 50;
-}
-
-int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
-  uint32_t addr = to_fwd->RIR>>21;
-  
-  // CAR to ASCM
-  if (bus_num == 0) {
-    // 383 == lkasteeringcmd proxy
-    if (addr == 383) {
-      handle_update_steering_override(to_fwd);
-      return -1;
-    }
-    // Get driver applied torque for safety check and then forward to ASCM
-    //if (addr == 388) {
-    //  int torque_driver_new = ((GET_BYTE(to_fwd, 6) & 0x7) << 8) | GET_BYTE(to_fwd, 7);
-    //  torque_driver_new = to_signed(torque_driver_new, 11);
-    //  // update array of samples
-    //  update_sample(&gm_torque_driver, torque_driver_new);
-    //  return 2;
-    //}
-    // 714 == gasregencmd proxy
-    if (addr == 714) {
-      handle_update_gasregencmd_override(to_fwd);
-      return -1;
-    }
-    // 879 == ASCMActiveCruiseControlStatus proxy
-    if (addr == 879) {
-      handle_update_acc_status_override(to_fwd);
-      return -1;
-    }
-    // BCM Button
-    //if (addr == 481) {
-      //uint8_t button_message_counter = to_fwd->RDHR & 0x000003;
-      //to_fwd->RDHR = UNPRESS_MSG[button_message_counter];
-    //}
-    return 2;
-  }
-
-  // ASCM to CAR
-  if (bus_num == 2) {
-    // 384 == lkasteeringcmd : Only update, steering is more complex because it cycles between 10 Hz and 50 Hz
-    // so this interceptor needs to be the heartbeat
-    if (addr == 384) {
-      handle_update_steering_oem(to_fwd);
-      return -1;
-    }
-    // 715 == gasregencmd
-    if (addr == 715) {
-      if (gas_regen_override_ttl > 0) {
-	uint32_t curr_rolling_counter = (to_fwd->RDLR & 0xC0U) >> 6;
-	if (handle_update_gasregencmd_override_rolling_counter(curr_rolling_counter)) {
-          to_fwd->RIR = gas_regen_override.RIR;
-          to_fwd->RDTR = gas_regen_override.RDTR;
-          to_fwd->RDLR = gas_regen_override.RDLR;
-          to_fwd->RDHR = gas_regen_override.RDHR;
-	}
-      }
-      return 0;
-    }
-    // 880 == ASCMActiveCruiseControlStatus
-    if (addr == 880) {
-      ascm_acc_cmd_active = (to_fwd->RDLR >> 23) & 1U;
-      if (acc_status_ttl > 0) {
-        to_fwd->RIR = acc_status_override.RIR;
-        to_fwd->RDTR = acc_status_override.RDTR;
-        to_fwd->RDLR = acc_status_override.RDLR;
-        to_fwd->RDHR = acc_status_override.RDHR;
-      }
-      return 0;
-    }
-
-    return 0;
-  }
-
-  return -1;
-}
-
 // CAN receive handlers
-// blink blue when we are receiving CAN messages
 void can_rx(uint8_t can_number) {
-  //enter_critical_section();
   CAN_TypeDef *CAN = CANIF_FROM_CAN_NUM(can_number);
   uint8_t bus_number = BUS_NUM_FROM_CAN_NUM(can_number);
   while (CAN->RF0R & CAN_RF0R_FMP0) {
     if (can_number == 0) {
       can0_rx_cnt++;
     }
-    if (can_number == 2) {
-      can2_rx_cnt++;
+    if (can_number == 1) {
+      can1_rx_cnt++;
     }
 
     // add to my fifo
@@ -904,7 +359,6 @@ void can_rx(uint8_t can_number) {
     // forwarding
     int bus_fwd_num = fwd_filter(bus_number, &to_tx);
     if (bus_fwd_num != -1) {
-      //can_tx(bus_fwd_num, &to_tx);
       can_push(can_queues[bus_fwd_num], &to_tx);
       process_can(CAN_NUM_FROM_BUS_NUM(bus_fwd_num));
     }
@@ -912,7 +366,6 @@ void can_rx(uint8_t can_number) {
     // next
     CAN->RF0R |= CAN_RF0R_RFOM0;
   }
-  //exit_critical_section();
 }
 
 void CAN1_TX_IRQHandler(void) { process_can(0); }
@@ -922,7 +375,3 @@ void CAN1_SCE_IRQHandler() { can_sce(CAN1); }
 void CAN2_TX_IRQHandler(void) { process_can(1); }
 void CAN2_RX0_IRQHandler() { can_rx(1); }
 void CAN2_SCE_IRQHandler() { can_sce(CAN2); }
-
-void CAN3_TX_IRQHandler(void) { process_can(2); }
-void CAN3_RX0_IRQHandler() { can_rx(2); }
-void CAN3_SCE_IRQHandler() { can_sce(CAN3); }

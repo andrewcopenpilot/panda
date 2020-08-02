@@ -13,7 +13,6 @@
 #include "gpio.h"
 
 #include "drivers/uart.h"
-#include "drivers/adc.h"
 #include "drivers/usb.h"
 #include "drivers/can.h"
 #include "drivers/timer.h"
@@ -201,14 +200,10 @@ int main() {
   usb_init();
 
   set_esp_mode(ESP_DISABLED);
-  can_set_gmlan(1);
 
-  //delay(20000000);
   can_init_all();
-  delay(10000000);
-  can_init_hw(0);
 
-  adc_init();
+  //adc_init();
 
   puts("**** INTERRUPTS ON ****\n");
 
@@ -236,12 +231,10 @@ int main() {
       //puts("cnt: "); puth(cnt);
       puts(" rx0: "); puth(can0_rx_cnt);
       puts(" tx0: "); puth(can0_tx_cnt);
-      puts(" rx2: "); puth(can2_rx_cnt);
-      puts(" tx2: "); puth(can2_tx_cnt);
+      puts(" rx1: "); puth(can1_rx_cnt);
+      puts(" tx1: "); puth(can1_tx_cnt);
 
       puts(" err: "); puth(can_err_cnt);
-      puts(" mboxfull0: "); puth(can0_mailbox_full_cnt);
-      puts(" mboxfull2: "); puth(can1_mailbox_full_cnt);
       puts("\n");
 
       CAN_TypeDef *CANZERO = CANIF_FROM_CAN_NUM(0);
@@ -258,18 +251,18 @@ int main() {
       puth(CANZERO->ESR);
       puts("\n");
 
-      CAN_TypeDef *CANTWO = CANIF_FROM_CAN_NUM(2);
-      puts("CAN3:  ");
+      CAN_TypeDef *CANONE = CANIF_FROM_CAN_NUM(0);
+      puts("CAN2:  ");
       puts("MSR:");
-      puth(CANTWO->MSR);
+      puth(CANONE->MSR);
       puts(" TSR:");
-      puth(CANTWO->TSR);
+      puth(CANONE->TSR);
       puts(" RF0R:");
-      puth(CANTWO->RF0R);
+      puth(CANONE->RF0R);
       puts(" RF1R:");
-      puth(CANTWO->RF1R);
+      puth(CANONE->RF1R);
       puts(" ESR:");
-      puth(CANTWO->ESR);
+      puth(CANONE->ESR);
       puts("\n");
     }
   }
