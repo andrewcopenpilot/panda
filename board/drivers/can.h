@@ -369,10 +369,11 @@ void can_init_all() {
  
   // filter mode register - CAN_FM1R_FBMX bit sets the associated filter bank to list mode. Only message IDs listed will be pushed to the rx fifo (vs ID mask mode)
   CAN1->FM1R = 0x00000000; // FM1R reset value
-  CAN1->FM1R |= CAN_FM1R_FBM0 | CAN_FM1R_FBM1 | CAN_FM1R_FBM2 | CAN_FM1R_FBM3 | CAN_FM1R_FBM4 | CAN_FM1R_FBM5 | CAN_FM1R_FBM6 | CAN_FM1R_FBM7 | CAN_FM1R_FBM8 | CAN_FM1R_FBM14 | CAN_FM1R_FBM15;
+  CAN1->FM1R |= CAN_FM1R_FBM0 | CAN_FM1R_FBM1 | CAN_FM1R_FBM2 | CAN_FM1R_FBM3 | CAN_FM1R_FBM4 | CAN_FM1R_FBM5 | CAN_FM1R_FBM6 | CAN_FM1R_FBM7 | CAN_FM1R_FBM8 | CAN_FM1R_FBM14 | CAN_FM1R_FBM15 | CAN_FM1R_FBM16; 
   
-  // filter scale register - Set all filter banks to be 32-bit (vs dual 16 bit)
-  CAN1->FS1R = 0x00000000; // Reset value
+  // filter scale register - Set all filter banks to be dual 16-bit (vs 32 bit)
+  CAN1->FS1R = 0x00000000; // Reset value (all 16 bit mode)
+  CAN1->FS1R = 0x0FFFFFFF; // Set all 28 filter banks to 32 bit mode
 
   // filter FIFO assignment register - Set all filters to store in FIFO 0 
   CAN1->FFA1R = 0x00000000;
@@ -380,7 +381,7 @@ void can_init_all() {
   // filter activation register - CAN_FA1R_FACTX bit activate the associated filter bank
   CAN1->FA1R = 0x00000000; // Reset value
 
-  CAN1->FA1R |= CAN_FA1R_FACT0 | CAN_FA1R_FACT1 | CAN_FA1R_FACT2 | CAN_FA1R_FACT3 | CAN_FA1R_FACT4 | CAN_FA1R_FACT5 | CAN_FA1R_FACT6 | CAN_FA1R_FACT7 | CAN_FA1R_FACT8 | CAN_FA1R_FACT14 | CAN_FA1R_FACT15;
+  CAN1->FA1R |= CAN_FA1R_FACT0 | CAN_FA1R_FACT1 | CAN_FA1R_FACT2 | CAN_FA1R_FACT3 | CAN_FA1R_FACT4 | CAN_FA1R_FACT5 | CAN_FA1R_FACT6 | CAN_FA1R_FACT7 | CAN_FA1R_FACT8 | CAN_FA1R_FACT14 | CAN_FA1R_FACT15 | CAN_FA1R_FACT16;
 
   //Set CAN 1 Filters CAR PT
   CAN1->sFilterRegister[0].FR1 = 0x24B<<21;
@@ -402,11 +403,13 @@ void can_init_all() {
   CAN1->sFilterRegister[8].FR1 = 0x17D<<21;
   CAN1->sFilterRegister[8].FR2 = 0x17D<<21;
 
-  // Set Can 2 Filters
-  CAN1->sFilterRegister[14].FR1 = 0x180<<21;
-  CAN1->sFilterRegister[14].FR2 = 0x2CB<<21;
-  CAN1->sFilterRegister[15].FR1 = 0x370<<21;
-  CAN1->sFilterRegister[15].FR2 = 0x370<<21;
+  // Set Can 2 Filters Obj
+  CAN1->sFilterRegister[14].FR1 = 0x180<<21; // lkasteeringcmd proxy 
+  CAN1->sFilterRegister[14].FR2 = 0x2CB<<21; // gasregencmd proxy
+  CAN1->sFilterRegister[15].FR1 = 0x370<<21; // ASCMActiveCruiseControlStatus proxy
+  CAN1->sFilterRegister[15].FR2 = 0x376<<21; // Interceptor Chas status
+  CAN1->sFilterRegister[16].FR1 = 0x377<<21; // Proxy SW GMLAN status
+  CAN1->sFilterRegister[16].FR2 = 0x377<<21; 
 
   CAN1->FMR &= ~(CAN_FMR_FINIT);
 
@@ -416,8 +419,9 @@ void can_init_all() {
   // filter mode register - Set all filter banks to mask mode
   CAN3->FM1R = 0x00000000; // Reset value
 
-  // filter scale register - Set all filter banks to be 32-bit (vs dual 16 bit)
-  CAN3->FS1R = 0x00000000; // Reset value
+  // filter scale register - Set all filter banks to be dual 16-bit (vs 32 bit)
+  CAN3->FS1R = 0x00000000; // Reset value (all 16 bit mode)
+  CAN3->FS1R = 0x00003FFF; // Set all 14 filter banks to 32 bit mode
 
   // filter FIFO assignment register - Set all filters to store in FIFO 0
   CAN3->FFA1R = 0x00000000; // Reset value
@@ -665,6 +669,7 @@ void send_steering_msg(uint32_t tick) {
 }
 
 void handle_update_steering_override(CAN_FIFOMailBox_TypeDef *override_msg) {
+    steering_override.RIR = override_msg->RIR;
     steering_override.RDTR = override_msg->RDTR;
     steering_override.RDLR = override_msg->RDLR;
     steering_override.RDHR = override_msg->RDHR;
@@ -682,6 +687,7 @@ void handle_update_steering_oem(CAN_FIFOMailBox_TypeDef *oem_msg) {
 }
 
 void handle_update_gasregencmd_override(CAN_FIFOMailBox_TypeDef *override_msg) {
+    gas_regen_override.RIR = override_msg->RIR;
     gas_regen_override.RDTR = override_msg->RDTR;
     gas_regen_override.RDLR = override_msg->RDLR;
     gas_regen_override.RDHR = override_msg->RDHR;
@@ -707,6 +713,7 @@ bool handle_update_gasregencmd_override_rolling_counter(uint32_t rolling_counter
 }
 
 void handle_update_acc_status_override(CAN_FIFOMailBox_TypeDef *override_msg) {
+  acc_status_override.RIR = override_msg->RIR;
   acc_status_override.RDTR = override_msg->RDTR;
   acc_status_override.RDLR = override_msg->RDLR;
   acc_status_override.RDHR = override_msg->RDHR;
