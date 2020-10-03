@@ -206,7 +206,7 @@ void can_init_all() {
 
   // filter mode register - CAN_FM1R_FBMX bit sets the associated filter bank to list mode. Only message IDs listed will be pushed to the rx fifo (vs ID mask mode)
   CAN1->FM1R = 0x00000000; // FM1R reset value
-  CAN1->FM1R |= CAN_FM1R_FBM0 | CAN_FM1R_FBM14 | CAN_FA1R_FACT15;
+  CAN1->FM1R |= CAN_FM1R_FBM14 | CAN_FA1R_FACT15;
 
   // filter scale register - Set all filter banks to be dual 16-bit (vs 32 bit)
   CAN1->FS1R = 0x00000000; // Reset value (all 16 bit mode)
@@ -316,6 +316,12 @@ int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
   if (bus_num == 1) {
     // lka icon
     if (addr == 0x104c006c) {
+      puts("\nSending LKA Icon: ");
+      puth(to_fwd->RIR);
+      puts("\n");
+      //to_fwd->RDTR = 3;
+      //to_fwd->RDLR = 0x00;
+      //to_fwd->RDHR = 0;
       return 0;
     }
   }
