@@ -390,7 +390,7 @@ void send_interceptor_status() {
     CAN_FIFOMailBox_TypeDef status;
 
     status.RIR = (0x376 << 21) | 1;
-    status.RDTR = 2;
+    status.RDTR = 8;
     status.RDLR = 0x01020304;
     status.RDHR = 0x05060708;
 
@@ -399,7 +399,7 @@ void send_interceptor_status() {
 }
 
 void handle_update_brake_override(CAN_FIFOMailBox_TypeDef *override_msg) {
-  brake_override.RIR = override_msg->RIR
+  brake_override.RIR = override_msg->RIR;
   brake_override.RDTR = override_msg->RDTR;
   brake_override.RDLR = override_msg->RDLR;
   brake_override.RDHR = override_msg->RDHR;
