@@ -16,8 +16,9 @@ powertrain: 0x184: power steering control module
 powertrain: 0x1F1: body control module
 powertrain: 0x140: body control module
 
-poertrain: 0x17D appears to be related to traction control status
+powertrain: 0x17D appears to be related to traction control status
 
+Powertrain: 0xBD (Volt Specific) Hybrid/EV Powertrain control module
 
 chassis: 0xC1: electronic brake control module
 chassis: 0xC5: electronic brake control module
@@ -401,7 +402,7 @@ void can_init_all() {
   CAN1->sFilterRegister[7].FR1 = 0x1F1<<21;
   CAN1->sFilterRegister[7].FR2 = 0x140<<21;
   CAN1->sFilterRegister[8].FR1 = 0x17D<<21;
-  CAN1->sFilterRegister[8].FR2 = 0x17D<<21;
+  CAN1->sFilterRegister[8].FR2 = 0xBD<<21;
 
   // Set Can 2 Filters Obj
   CAN1->sFilterRegister[14].FR1 = 0x180<<21; // lkasteeringcmd proxy 
