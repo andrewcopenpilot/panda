@@ -113,6 +113,7 @@ void periph_init() {
   #endif
   RCC->APB1ENR |= RCC_APB1ENR_CAN1EN;
   RCC->APB1ENR |= RCC_APB1ENR_CAN2EN;
+  RCC->APB1ENR |= RCC_APB1ENR_CAN3EN;
   RCC->APB1ENR |= RCC_APB1ENR_DACEN;
   RCC->APB1ENR |= RCC_APB1ENR_TIM2EN;
   RCC->APB1ENR |= RCC_APB1ENR_TIM3EN;
@@ -128,16 +129,6 @@ void periph_init() {
 }
 
 // ********************* setters *********************
-
-void set_can_enable(CAN_TypeDef *CAN, int enabled) {
-  // enable CAN busses
-  if (CAN == CAN1) {
-      set_gpio_output(GPIOC, 1, enabled);
-      set_gpio_output(GPIOA, 0, enabled);
-  } else if (CAN == CAN2) {
-      set_gpio_output(GPIOC, 13, !enabled);
-  }
-}
 
 #ifdef PANDA
   #define LED_RED 9
@@ -210,6 +201,16 @@ void set_esp_mode(int mode) {
   }
 }
 
+void set_sw_gmlan_hv_wakeup() {
+  set_gpio_output(GPIOB, 14, 1); //mode1
+  set_gpio_output(GPIOB, 15, 0); //mode0
+}
+
+void set_sw_gmlan_normal() {
+  set_gpio_output(GPIOB, 14, 1); //mode1
+  set_gpio_output(GPIOB, 15, 1); //mode0
+}
+
 // ********************* big init function *********************
 
 // board specific
@@ -248,6 +249,18 @@ void gpio_init() {
   // B12: GMLAN, ignition sense, pull up
   //set_gpio_pullup(GPIOB, 12, PULL_UP);
   set_gpio_pullup(GPIOB, 8, PULL_UP);
+  set_gpio_pullup(GPIOA, 8, PULL_UP);
+
+  /* GMLAN mode pins:
+      M0(B15)  M1(B14)  mode
+      =======================
+      0        0        sleep
+      1        0        100kbit
+      0        1        high voltage wakeup
+      1        1        33kbit (normal)
+  */
+  set_gpio_output(GPIOB, 14, 1); //mode1
+  set_gpio_output(GPIOB, 15, 1); //mode0
 
   // A4,A5,A6,A7: setup SPI
   set_gpio_alternate(GPIOA, 4, GPIO_AF5_SPI1);
@@ -259,29 +272,14 @@ void gpio_init() {
   // B8,B9: CAN 1
   set_gpio_alternate(GPIOB, 8, GPIO_AF8_CAN1);
   set_gpio_alternate(GPIOB, 9, GPIO_AF8_CAN1);
-  //set_gpio_alternate(GPIOB, 8, GPIO_AF9_CAN1);
-  //set_gpio_alternate(GPIOB, 9, GPIO_AF9_CAN1);
-  set_can_enable(CAN1, 1);
 
   // B5,B6: CAN 2
-//  set_can_mode(1, 0);
   set_gpio_alternate(GPIOB, 12, GPIO_AF9_CAN2);
   set_gpio_alternate(GPIOB, 13, GPIO_AF9_CAN2);
 
-  set_can_enable(CAN2, 1);
-
-  /* GMLAN mode pins:
-  M0(B15)  M1(B14)  mode
-  =======================
-  0        0        sleep
-  1        0        100kbit
-  0        1        high voltage wakeup
-  1        1        33kbit (normal)
-  */
-
-  // put gmlan transceiver in normal mode
-  set_gpio_output(GPIOB, 14, 1);
-  set_gpio_output(GPIOB, 15, 1);
+  //A8,A15 CAN 3
+  set_gpio_alternate(GPIOA, 8, GPIO_AF11_CAN3);
+  set_gpio_alternate(GPIOA, 15, GPIO_AF11_CAN3);
 
   if (revision == PANDA_REV_C) {
     set_usb_power_mode(USB_POWER_CLIENT);

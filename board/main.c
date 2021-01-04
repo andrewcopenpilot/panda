@@ -217,7 +217,7 @@ int main() {
 
   CAN1->IER |= CAN_IER_ERRIE | CAN_IER_LECIE;
 
-  // LED should keep on blinking all the time
+ // LED should keep on blinking all the time
   uint64_t cnt = 0;
 
 
@@ -233,6 +233,9 @@ int main() {
       puts(" tx0: "); puth(can0_tx_cnt);
       puts(" rx1: "); puth(can1_rx_cnt);
       puts(" tx1: "); puth(can1_tx_cnt);
+      puts(" rx2: "); puth(can2_rx_cnt);
+      puts(" tx2: "); puth(can2_tx_cnt);
+
 
       puts(" err: "); puth(can_err_cnt);
       puts("\n");
@@ -251,7 +254,7 @@ int main() {
       puth(CANZERO->ESR);
       puts("\n");
 
-      CAN_TypeDef *CANONE = CANIF_FROM_CAN_NUM(0);
+      CAN_TypeDef *CANONE = CANIF_FROM_CAN_NUM(1);
       puts("CAN2:  ");
       puts("MSR:");
       puth(CANONE->MSR);
@@ -263,6 +266,20 @@ int main() {
       puth(CANONE->RF1R);
       puts(" ESR:");
       puth(CANONE->ESR);
+      puts("\n");
+
+      CAN_TypeDef *CANTWO = CANIF_FROM_CAN_NUM(2);
+      puts("CAN3:  ");
+      puts("MSR:");
+      puth(CANTWO->MSR);
+      puts(" TSR:");
+      puth(CANTWO->TSR);
+      puts(" RF0R:");
+      puth(CANTWO->RF0R);
+      puts(" RF1R:");
+      puth(CANTWO->RF1R);
+      puts(" ESR:");
+      puth(CANTWO->ESR);
       puts("\n");
     }
   }
