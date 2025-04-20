@@ -44,7 +44,7 @@ can_buffer(tx3_q, 0x100)
 can_buffer(txgmlan_q, 0x100)
 can_ring *can_queues[] = {&can_tx1_q, &can_tx2_q, &can_tx3_q, &can_txgmlan_q};
 
-const int GM_MAX_BRAKE = 350;
+const int GM_MAX_BRAKE = 400;
 
 int can_err_cnt = 0;
 int can0_mailbox_full_cnt = 0;
