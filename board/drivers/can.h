@@ -38,6 +38,13 @@ chassis: 0xc0: seems to be needed for auto highbeams
   CAN_FIFOMailBox_TypeDef elems_##x[size]; \
   can_ring can_##x = { .w_ptr = 0, .r_ptr = 0, .fifo_size = size, .elems = (CAN_FIFOMailBox_TypeDef *)&elems_##x };
 
+// Define individual bits by position
+#define BIT(n)              (1UL << (n))
+
+// Define specific status bits
+#define STATUS_SYSTEM_HEALTHY    BIT(0)
+#define STATUS_BRAKE_EXCEEDED    BIT(1)
+
 can_buffer(tx1_q, 0x100)
 can_buffer(tx2_q, 0x100)
 can_buffer(tx3_q, 0x100)
@@ -45,6 +52,9 @@ can_buffer(txgmlan_q, 0x100)
 can_ring *can_queues[] = {&can_tx1_q, &can_tx2_q, &can_tx3_q, &can_txgmlan_q};
 
 const int GM_MAX_BRAKE = 400;
+
+bool system_healthy = true;
+bool brake_max_exceeded = false;
 
 int can_err_cnt = 0;
 int can0_mailbox_full_cnt = 0;
@@ -389,10 +399,18 @@ void TIM3_IRQHandler(void) {
 void send_interceptor_status() {
     CAN_FIFOMailBox_TypeDef status;
 
+    uint32_t status_RDLR = STATUS_SYSTEM_HEALTHY;  // System healthy by default
+
+    // Check fault conditions and update status accordingly
+    if (brake_max_exceeded) {
+	CLEAR_BIT(status_RDLR, STATUS_SYSTEM_HEALTHY);
+	SET_BIT(status_RDLR, STATUS_BRAKE_EXCEEDED);
+    }
+
     status.RIR = (0x376 << 21) | 1;
     status.RDTR = 8;
-    status.RDLR = 0x01020304;
-    status.RDHR = 0x05060708;
+    status.RDLR = status_RDLR;
+    status.RDHR = 0x00000000;
 
     can_push(can_queues[1], &status);
     process_can(CAN_NUM_FROM_BUS_NUM(1));
@@ -421,6 +439,7 @@ bool handle_update_brake_override_rolling_counter(uint32_t rolling_counter) {
   int brake = ((GET_BYTE(&brake_override, 0) & 0xFU) << 8) + GET_BYTE(&brake_override, 1);
   brake = (0x1000 - brake) & 0xFFF;
   if (brake > GM_MAX_BRAKE) {
+    brake_max_exceeded = true;
     return false;
   }
   return true;
