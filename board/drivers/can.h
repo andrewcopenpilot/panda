@@ -203,12 +203,56 @@ int can1_tx_cnt = 0;
 int can2_tx_cnt = 0;
 
 uint32_t tick = 0;
-uint8_t ascm_acc_cmd_active = 0;
+volatile uint8_t ascm_acc_cmd_active = 0;
 
 void can_send(CAN_FIFOMailBox_TypeDef *to_push, uint8_t bus_number);
 bool can_pop(can_ring *q, CAN_FIFOMailBox_TypeDef *elem);
 void send_interceptor_status();
 void send_steering_msg(uint32_t tick);
+void update_interceptor_mode(void);
+void emit_synth_370(void);
+void emit_synth_2cb(void);
+void emit_synth_1e1(uint8_t acc_buttons);
+void rewrite_2cb_counter(CAN_FIFOMailBox_TypeDef *frame);
+
+// Interceptor operating modes:
+//   M1 (ASCM PT)  — ASCM has priority. OEM cruise drives the car if engaged.
+//                   Also the default when comma is absent or nothing is engaged.
+//   M2 (OP PT)    — OP is engaged AND ASCM is not. OP's overrides reach the car.
+//   M3 (NO PT)    — failsafe: both OP and ASCM engaged simultaneously. Synthetic
+//                   idle frames hold the powertrain bus quiet on bus 0. Releases
+//                   only when both sides are observed disengaged (windup safety).
+typedef enum {
+  MODE_M1_ASCM_PT = 0,
+  MODE_M2_OP_PT = 1,
+  MODE_M3_NO_PT = 2,
+} interceptor_mode_t;
+
+volatile interceptor_mode_t interceptor_mode = MODE_M1_ASCM_PT;
+
+// Synthetic M3 payloads — what the powertrain bus looks like when no cruise
+// is active. Sourced from bus captures of an idle vehicle.
+// 0x370 has no rolling counter and no checksum; payload is fully constant.
+const uint8_t SYNTH_370_PAYLOAD[6] = {0x01, 0x00, 0x20, 0x00, 0x01, 0x00};
+// 0x2CB: bytes 1-3 are constant payload (regen=-650 Nm, inactive); byte 0
+// holds the 2-bit rolling counter at bits 6-7; bytes 4-7 are the 32-bit
+// checksum recomputed per frame using openpilot's create_gas_regen_command
+// formula. With enabled=0:
+//   byte 4 = 1, byte 5 = 0xFF-b1, byte 6 = 0xFF-b2, byte 7 = (0x100-b3-cnt)
+const uint8_t SYNTH_2CB_BYTE1 = 0x42;
+const uint8_t SYNTH_2CB_BYTE2 = 0xAB;
+const uint8_t SYNTH_2CB_BYTE3 = 0xE0;
+volatile uint8_t synth_2cb_counter = 0;
+
+// 0x1E1 (ASCMSteeringButton) suppression. When comma is alive, BCM's natural
+// 0x1E1 forward to ASCM is replaced with a synthetic ACCButtons=None frame —
+// so the user pressing SET/RESUME/MAIN on the wheel can't engage ASCM, which
+// lets OP engage cleanly without dropping into M3 failsafe. Cancel passes
+// through unchanged so the user retains a wheel-button path to disengage
+// OEM cruise (in addition to brake pedal).
+#define ACC_BUTTONS_NONE   1U
+#define ACC_BUTTONS_CANCEL 6U
+volatile uint8_t synth_1e1_counter = 0;
 
 CAN_FIFOMailBox_TypeDef steering_oem;
 volatile int steering_oem_ttl = 0;
@@ -328,9 +372,10 @@ void process_can(uint8_t can_number) {
           #endif
         }
 
-        // clear interrupt
-        // careful, this can also be cleared by requesting a transmission
-        CAN->TSR |= CAN_TSR_RQCP0;
+        // clear interrupt. TSR is full of W1C bits — write the mask directly
+        // rather than |= so we don't accidentally clear other completion flags
+        // (RQCP1/2, ALST*, TERR*, ...) if they're set.
+        CAN->TSR = CAN_TSR_RQCP0;
       }
 
       if (can_pop(can_queues[bus_number], &to_send)) {
@@ -526,17 +571,59 @@ void can_sce(CAN_TypeDef *CAN) {
   puth(CAN->ESR);
   puts("\n");
 
-  // clear current send
-  CAN->TSR |= CAN_TSR_ABRQ0;
-  CAN->MSR &= ~(CAN_MSR_ERRI);
+  // abort the in-flight send on mailbox 0. ABRQ0 is set-by-software /
+  // reset-by-hardware (reads as 0), so a direct write sets it without
+  // disturbing TSR's W1C status bits (RQCP*/TXOK*/ALST*/TERR*).
+  CAN->TSR = CAN_TSR_ABRQ0;
+  // MSR = MSR clears all set W1C flags (ERRI/WKUI/SLAKI): the read returns
+  // their current values, and writing 1 to a W1C bit clears it.
   CAN->MSR = CAN->MSR;
 
   exit_critical_section();
 }
 
+// Mode is a near-stateless function of (op_engaged, ascm_engaged) with one
+// exception: M3 exit requires BOTH sides observed disengaged. The lock is
+// the windup safety — while in M3 we suppress ASCM's 0x370/0x2CB on bus 0,
+// so the ASCM's integrator may have grown. Waiting for ascm_engaged=0 before
+// releasing M3 means the ASCM's active bit is gated off by the ECM at the
+// moment of release, neutralizing any wound-up commands.
+//   M3 -> M1       : !op_engaged && !ascm_engaged  (both must drop together)
+//   M1/M2 -> M3    : op_engaged && ascm_engaged    (failsafe entry)
+//   M1/M2 -> M2    : op_engaged && !ascm_engaged   (OP drives cleanly)
+//   M1/M2 -> M1    : !op_engaged                   (ASCM or nobody drives)
+// op_engaged := OP's 0x370 override active bit set AND its TTL alive.
+// ascm_engaged := ascm_acc_cmd_active, last seen on the real ASCM's 0x370.
+void update_interceptor_mode(void) {
+  bool op_engaged = (acc_status_ttl > 0) &&
+                    (((acc_status_override.RDLR >> 23) & 1U) != 0U);
+  bool ascm_engaged = (ascm_acc_cmd_active != 0U);
+
+  if (interceptor_mode == MODE_M3_NO_PT) {
+    if (!op_engaged && !ascm_engaged) {
+      interceptor_mode = MODE_M1_ASCM_PT;
+    }
+    // else: stay in M3 until both sides confirm disengaged
+  } else {
+    if (op_engaged && ascm_engaged) {
+      interceptor_mode = MODE_M3_NO_PT;
+    } else if (op_engaged) {
+      interceptor_mode = MODE_M2_OP_PT;
+    } else {
+      interceptor_mode = MODE_M1_ASCM_PT;
+    }
+  }
+}
+
+// TIM3 ticks at 50 Hz. APB1 timer clock is 48 MHz on this part, so:
+//   48 MHz / (PSC+1=4800) = 10 kHz counter clock
+//   10 kHz / (ARR+1=200)  = 50 Hz update events
+// Downstream consumers of this rate: 0x180 emission (10 Hz inactive via /5,
+// 50 Hz active), and the mode-state and TTL-decrement logic.
+#define TIM3_HZ 50
 void ttl_timer_init() {
-  TIM3->PSC = 4800-1;	        // Set prescaler to 24 000 (PSC + 1)
-  TIM3->ARR = 200-1;	          // Auto reload value 1000
+  TIM3->PSC = 4800-1;        // counter clock = 48 MHz / 4800 = 10 kHz
+  TIM3->ARR = 200-1;         // update event   = 10 kHz / 200  = 50 Hz
   TIM3->DIER = TIM_DIER_UIE; // Enable update interrupt (timer level)
   TIM3->CR1 = TIM_CR1_CEN;   // Enable timer
 
@@ -563,9 +650,16 @@ if (TIM3->SR & TIM_SR_UIF) // if UIF flag is set
     }
     exit_critical_section();
 
+    update_interceptor_mode();
+
     tick++;
     if (tick % 5 == 0) {
         send_interceptor_status();
+    }
+    // M3 synthetic emission at 25 Hz (every other 50 Hz TIM3 tick).
+    if ((interceptor_mode == MODE_M3_NO_PT) && ((tick % 2U) == 0U)) {
+        emit_synth_370();
+        emit_synth_2cb();
     }
     send_steering_msg(tick);
   }
@@ -577,34 +671,169 @@ int RESUME_MSG[4] = {0xBF2C00, 0xEE2101, 0xDD2602, 0xCC2B03};
 int UNPRESS_MSG[4] = {0xFF1000, 0xEE1501, 0xDD1A02, 0xCC1F03};
 int CRUISE_MAIN_MSG[4] = {0xBF5000, 0xAE5501, 0x9D5A02, 0x8C5F03};
 
+// Emit a synthetic 0x370 (ASCMActiveCruiseControlStatus) "no cruise active"
+// frame onto bus 0 (toward car). Sent at 25 Hz from TIM3 when in M3 mode.
+void emit_synth_370(void) {
+    CAN_FIFOMailBox_TypeDef frame;
+    union {
+        uint8_t bytes[8];
+        struct { uint32_t lo; uint32_t hi; };
+    } data = {{0}};
+
+    for (uint8_t i = 0; i < 6U; i++) {
+        data.bytes[i] = SYNTH_370_PAYLOAD[i];
+    }
+
+    frame.RIR = (0x370 << 21) | 1U;  // standard ID, TXRQ
+    frame.RDTR = 6U;                  // DLC = 6
+    frame.RDLR = data.lo;
+    frame.RDHR = data.hi;
+
+    can_push(can_queues[0], &frame);
+    process_can(CAN_NUM_FROM_BUS_NUM(0));
+}
+
+// Emit a synthetic 0x2CB (ASCMGasRegenCmd) "natural idle" frame onto bus 0
+// (toward car). Sent at 25 Hz from TIM3 when in M3 mode. Counter increments
+// every emit; checksum is recomputed each frame.
+// Fill a frame with the synthetic 0x2CB idle payload (regen=-650 Nm, enabled=0)
+// without setting the rolling counter or checksum byte 7 — those are set by
+// rewrite_2cb_counter, which the caller invokes afterward.
+void fill_synth_2cb(CAN_FIFOMailBox_TypeDef *frame) {
+    union {
+        uint8_t bytes[8];
+        struct { uint32_t lo; uint32_t hi; };
+    } data = {{0}};
+
+    // Signal payload bytes 1-3 are constant for natural idle. Byte 0 bits 0-5
+    // are zero in idle; bits 6-7 (counter) are set by rewrite_2cb_counter.
+    data.bytes[1] = SYNTH_2CB_BYTE1;
+    data.bytes[2] = SYNTH_2CB_BYTE2;
+    data.bytes[3] = SYNTH_2CB_BYTE3;
+
+    // 32-bit checksum bytes 4-6. Byte 4 = (1 - enabled) = 1 with enabled=0.
+    // Bytes 5-6 are derived from constant payload bytes 1-2 (counter-independent).
+    // Byte 7 is set by rewrite_2cb_counter.
+    data.bytes[4] = 1U;
+    data.bytes[5] = (uint8_t)(0xFFU - SYNTH_2CB_BYTE1);
+    data.bytes[6] = (uint8_t)(0xFFU - SYNTH_2CB_BYTE2);
+
+    frame->RIR = (0x2CB << 21) | 1U;  // standard ID, TXRQ
+    frame->RDTR = 8U;                  // DLC = 8
+    frame->RDLR = data.lo;
+    frame->RDHR = data.hi;
+}
+
+void emit_synth_2cb(void) {
+    CAN_FIFOMailBox_TypeDef frame;
+    fill_synth_2cb(&frame);
+    rewrite_2cb_counter(&frame);
+    can_push(can_queues[0], &frame);
+    process_can(CAN_NUM_FROM_BUS_NUM(0));
+}
+
+// Emit a synthetic 0x1E1 (ASCMSteeringButton) frame onto bus 2 (toward ASCM)
+// with the given ACCButtons value. Called from fwd_filter on every BCM 0x1E1
+// frame we choose to suppress, so the cadence naturally matches the BCM's
+// ~33 Hz. All other fields (DistanceButton, LKAButton, DriveModeButton) are
+// zeroed — checksum formula from openpilot's create_buttons is only known
+// for that subset of inputs.
+void emit_synth_1e1(uint8_t acc_buttons) {
+    CAN_FIFOMailBox_TypeDef frame;
+    union {
+        uint8_t bytes[8];
+        struct { uint32_t lo; uint32_t hi; };
+    } data = {{0}};
+
+    // 12-bit checksum: 240 + (1 * 0xF) + (counter * 0x4EF) - ((acc_buttons-1) << 4)
+    // with ACCAlwaysOne=1 and DistanceButton=0 baked in.
+    uint32_t checksum = 0xFFU
+                      + ((uint32_t)synth_1e1_counter * 0x4EFU)
+                      - ((uint32_t)(acc_buttons - 1U) << 4);
+    checksum &= 0xFFFU;
+
+    // Byte 3 bit 0: ACCAlwaysOne (=1)
+    data.bytes[3] = 0x01U;
+    // Byte 4 bits 0-1: RollingCounter
+    data.bytes[4] = synth_1e1_counter & 0x3U;
+    // Byte 5 bits 4-6: ACCButtons; bits 0-3: checksum upper nibble
+    data.bytes[5] = (uint8_t)(((acc_buttons & 0x7U) << 4) | ((checksum >> 8) & 0xFU));
+    // Byte 6: checksum lower byte
+    data.bytes[6] = (uint8_t)(checksum & 0xFFU);
+
+    frame.RIR = (0x1E1U << 21) | 1U;
+    frame.RDTR = 7U;  // DLC = 7
+    frame.RDLR = data.lo;
+    frame.RDHR = data.hi;
+
+    can_push(can_queues[2], &frame);
+    process_can(CAN_NUM_FROM_BUS_NUM(2));
+
+    synth_1e1_counter = (synth_1e1_counter + 1U) & 0x3U;
+}
+
+// 0x375 status frame to comma 3.
 void send_interceptor_status() {
     CAN_FIFOMailBox_TypeDef status;
 
+    bool op_engaged = (acc_status_ttl > 0) &&
+                      (((acc_status_override.RDLR >> 23) & 1U) != 0U);
+
+    // CAN payload, byte-addressable for readability, word-addressable for
+    // assignment into RDLR/RDHR.
+    union {
+        uint8_t bytes[8];
+        struct { uint32_t lo; uint32_t hi; };
+    } data = {{0}};
+
+    // byte 0: flags
+    const uint8_t ASCM_ACTIVE_BIT  = 0;
+    const uint8_t MODE_SHIFT       = 1;  // 2 bits wide
+    const uint8_t OP_ENGAGED_BIT   = 3;
+    data.bytes[0] = ((ascm_acc_cmd_active & 0x1U)  << ASCM_ACTIVE_BIT)
+                  | ((interceptor_mode    & 0x3U)  << MODE_SHIFT)
+                  | ((op_engaged ? 1U : 0U)        << OP_ENGAGED_BIT);
+
+    // byte 4: steering safety-check violation counter
+    data.bytes[4] = steering_violation_cnt;
+
     status.RIR = (885 << 21) | 1;
     status.RDTR = 8;
-    status.RDLR = 0;
-    status.RDLR |= ascm_acc_cmd_active;
-    status.RDHR = 0xFFFFFFFF | steering_violation_cnt;
+    status.RDLR = data.lo;
+    status.RDHR = data.hi;
 
     can_push(can_queues[1], &status);
     process_can(CAN_NUM_FROM_BUS_NUM(1));
-}	
+}
 
 void send_steering_msg(uint32_t tick) {
     CAN_FIFOMailBox_TypeDef steer;
     steer.RIR = (0x180 << 21) | 1;
 
-    if (steering_override_ttl > 0) {
-    	steer.RDTR = steering_override.RDTR;
-    	steer.RDLR = steering_override.RDLR;
-    	steer.RDHR = steering_override.RDHR;
-    }
-    else if (steering_oem_ttl > 0) {
+    // Source selection by mode:
+    //   M1 -> ASCM's stored 0x180 (passthrough)
+    //   M2 -> OP's stored 0x180 override
+    //   M3 -> synthetic torque=0, active=0 (failsafe)
+    // If the chosen source has no fresh content (TTL expired), fall through to
+    // synthetic rather than the other source — preserves mode semantics, and
+    // synthetic-as-fallback keeps a heartbeat on the bus so the PSCM doesn't
+    // fault on missing 0x180.
+    if (interceptor_mode == MODE_M2_OP_PT && steering_override_ttl > 0) {
+        steer.RDTR = steering_override.RDTR;
+        steer.RDLR = steering_override.RDLR;
+        steer.RDHR = steering_override.RDHR;
+    } else if (interceptor_mode == MODE_M1_ASCM_PT && steering_oem_ttl > 0) {
         steer.RDTR = steering_oem.RDTR;
-	steer.RDLR = steering_oem.RDLR;
-	steer.RDHR = steering_oem.RDHR;
-    }
-    else {
+        steer.RDLR = steering_oem.RDLR;
+        steer.RDHR = steering_oem.RDHR;
+    } else if (interceptor_mode == MODE_M3_NO_PT
+               || (interceptor_mode == MODE_M2_OP_PT && steering_override_ttl == 0)) {
+        // synthetic: zeroed payload -> torque=0, active=0
+        steer.RDTR = 4;  // DLC = 4
+        steer.RDLR = 0;
+        steer.RDHR = 0;
+    } else {
+        // M1 with no OEM content — preserve existing "stop emitting" behavior
         return;
     }
 
@@ -697,20 +926,21 @@ void handle_update_gasregencmd_override(CAN_FIFOMailBox_TypeDef *override_msg) {
 }
 
 
-bool handle_update_gasregencmd_override_rolling_counter(uint32_t rolling_counter) {
-  gas_regen_override.RDLR &= 0xFFFFFF3FU;
-  gas_regen_override.RDLR |= (rolling_counter << 6);
-  uint32_t checksum3 = (0x100U - ((gas_regen_override.RDLR & 0xFF000000U) >> 24) - rolling_counter) & 0xFFU;
-
-  gas_regen_override.RDHR &= 0x00FFFFFFU;
-  gas_regen_override.RDHR = gas_regen_override.RDHR | (checksum3 << 24);
-
-  // GAS/REGEN: safety check - TODO disable system instead of just dropping out of saftey range messages
-  int gas_regen = ((GET_BYTE(&gas_regen_override, 2) & 0x7FU) << 5) + ((GET_BYTE(&gas_regen_override, 3) & 0xF8U) >> 3);
-  if (gas_regen > GM_MAX_GAS) {
-    return false;
-  }
-  return true;
+// Rewrite the rolling counter in an in-flight 0x2CB frame with our
+// interceptor-owned counter, recompute byte 7 of the 32-bit checksum
+// (the only checksum byte that depends on the counter), and advance our
+// counter by one. Bytes 4-6 of the checksum depend only on the payload
+// (enabled bit / byte 1 / byte 2) and are left untouched — they came from
+// a known-good source (ASCM passthrough or OP override) and stay valid.
+void rewrite_2cb_counter(CAN_FIFOMailBox_TypeDef *frame) {
+  // Set byte 0 bits 6-7 to our counter
+  frame->RDLR = (frame->RDLR & 0xFFFFFF3FU)
+              | ((uint32_t)(synth_2cb_counter & 0x3U) << 6);
+  // Recompute byte 7: (0x100 - byte 3 - counter) & 0xFF
+  uint8_t byte3 = (uint8_t)((frame->RDLR & 0xFF000000U) >> 24);
+  uint8_t byte7 = (uint8_t)(0x100U - byte3 - synth_2cb_counter);
+  frame->RDHR = (frame->RDHR & 0x00FFFFFFU) | ((uint32_t)byte7 << 24);
+  synth_2cb_counter = (synth_2cb_counter + 1U) & 0x3U;
 }
 
 void handle_update_acc_status_override(CAN_FIFOMailBox_TypeDef *override_msg) {
@@ -727,6 +957,18 @@ int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
   
   // CAR to ASCM
   if (bus_num == 0) {
+    // Block engage button presses from reaching ASCM while comma is alive,
+    // so OP can engage without ASCM also engaging (which would land us in M3
+    // failsafe). Cancel passes through so the user can still disengage OEM
+    // cruise via wheel button. Other ACCButtons values get replaced with
+    // None via a synthetic frame.
+    if ((addr == 0x1E1) && (acc_status_ttl > 0)) {
+      uint8_t bcm_acc_buttons = (GET_BYTE(to_fwd, 5) >> 4) & 0x7U;
+      if (bcm_acc_buttons != ACC_BUTTONS_CANCEL) {
+        emit_synth_1e1(ACC_BUTTONS_NONE);
+        return -1;
+      }
+    }
     return 2;
   }
 
@@ -757,21 +999,49 @@ int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
     }
     // 0x2CB == gasregencmd
     if (addr == 0x2CB) {
-      if (gas_regen_override_ttl > 0) {
-	uint32_t curr_rolling_counter = (to_fwd->RDLR & 0xC0U) >> 6;
-	if (handle_update_gasregencmd_override_rolling_counter(curr_rolling_counter)) {
+      // In M3, our TIM3-driven synthetic emission is the sole source on bus 0;
+      // suppress the forward to avoid double frames with conflicting counters.
+      if (interceptor_mode == MODE_M3_NO_PT) {
+        return -1;
+      }
+      // In M2, substitute payload with OP's override (subject to safety bound).
+      // If OP's request is out of bounds, fall back to synthetic idle — never
+      // pass ASCM's wound-up content through in M2.
+      // In M1, pass ASCM's payload through unchanged so OEM cruise works.
+      if (interceptor_mode == MODE_M2_OP_PT && gas_regen_override_ttl > 0) {
+        int gas_regen = ((GET_BYTE(&gas_regen_override, 2) & 0x7FU) << 5)
+                      + ((GET_BYTE(&gas_regen_override, 3) & 0xF8U) >> 3);
+        if (gas_regen <= GM_MAX_GAS) {
           to_fwd->RIR = gas_regen_override.RIR;
           to_fwd->RDTR = gas_regen_override.RDTR;
           to_fwd->RDLR = gas_regen_override.RDLR;
           to_fwd->RDHR = gas_regen_override.RDHR;
-	}
+        } else {
+          // OP out of safety bounds — emit synthetic idle in its place.
+          fill_synth_2cb(to_fwd);
+        }
       }
+      // Apply interceptor-owned rolling counter on every emit so the counter
+      // sequence on bus 0 is monotonic across all M1/M2/M3 transitions.
+      rewrite_2cb_counter(to_fwd);
       return 0;
     }
     // 0x370 == ASCMActiveCruiseControlStatus
     if (addr == 0x370) {
+      // Track real ASCM active bit regardless of mode — the state machine
+      // depends on it to release M3. The bit is intentionally NOT decayed
+      // on ASCM silence: a silent ASCM might still be engaged with a
+      // wound-up integrator, and we'd rather stay locked in M3 than risk
+      // releasing into M1/M2 only to have ASCM resume and dump that into
+      // the powertrain bus.
       ascm_acc_cmd_active = (to_fwd->RDLR >> 23) & 1U;
-      if (acc_status_ttl > 0) {
+      // In M3, synthetic emission owns bus 0 for this address; suppress fwd.
+      if (interceptor_mode == MODE_M3_NO_PT) {
+        return -1;
+      }
+      // Substitute with OP's override only in M2. In M1 we pass ASCM's frame
+      // through so OEM cruise (if engaged) keeps reaching the car ECM.
+      if (interceptor_mode == MODE_M2_OP_PT && acc_status_ttl > 0) {
         to_fwd->RIR = acc_status_override.RIR;
         to_fwd->RDTR = acc_status_override.RDTR;
         to_fwd->RDLR = acc_status_override.RDLR;
