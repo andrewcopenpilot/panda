@@ -38,22 +38,16 @@ chassis: 0xc0: seems to be needed for auto highbeams
   CAN_FIFOMailBox_TypeDef elems_##x[size]; \
   can_ring can_##x = { .w_ptr = 0, .r_ptr = 0, .fifo_size = size, .elems = (CAN_FIFOMailBox_TypeDef *)&elems_##x };
 
-// Define individual bits by position
-#define BIT(n)              (1UL << (n))
-
-// Define specific status bits
-#define STATUS_SYSTEM_HEALTHY    BIT(0)
-#define STATUS_BRAKE_EXCEEDED    BIT(1)
-
 can_buffer(tx1_q, 0x100)
 can_buffer(tx2_q, 0x100)
 can_buffer(tx3_q, 0x100)
 can_buffer(txgmlan_q, 0x100)
 can_ring *can_queues[] = {&can_tx1_q, &can_tx2_q, &can_tx3_q, &can_txgmlan_q};
 
-const int GM_MAX_BRAKE = 400;
+// Signed 12-bit EBCM acceleration request, in CAN counts.
+const int GM_MIN_ACCEL_REQUEST = -400;
+const int GM_MAX_ACCEL_REQUEST = 200;
 
-bool system_healthy = true;
 bool brake_max_exceeded = false;
 
 int can_err_cnt = 0;
@@ -71,11 +65,39 @@ uint32_t tick = 0;
 void can_send(CAN_FIFOMailBox_TypeDef *to_push, uint8_t bus_number);
 bool can_pop(can_ring *q, CAN_FIFOMailBox_TypeDef *elem);
 void send_interceptor_status();
+void update_chassis_mode(void);
+void fill_synth_315(CAN_FIFOMailBox_TypeDef *frame);
+void rewrite_315_counter(CAN_FIFOMailBox_TypeDef *frame);
+
+// Chassis operating mode. Mirrors the PT interceptor's interceptor_mode via
+// the 0x375 broadcast on OBJ, with local overrides for safety:
+//   M1 (ASCM PT)  — pass ASCM 0x315 through
+//   M2 (OP PT)    — substitute with comma's 0x315 override
+//   M3 (NO PT)    — failsafe: synthetic zero-brake on bus 0
+// Forced to M3 if PT goes silent (pt_status_ttl expires) or if a local fault
+// is latched. This keeps the chassis safe even if the PT broadcast is lost.
+typedef enum {
+  MODE_M1_ASCM_PT = 0,
+  MODE_M2_OP_PT = 1,
+  MODE_M3_NO_PT = 2,
+} chassis_mode_t;
+
+// Last-reported PT mode (decoded from incoming 0x375). Goes stale if PT
+// broadcast stops; pt_status_ttl tracks freshness.
+volatile chassis_mode_t pt_mode = MODE_M1_ASCM_PT;
+volatile int pt_status_ttl = 0;
+// Effective chassis mode, derived from pt_mode + local fault state.
+// Set by update_chassis_mode() in the TIM3 IRQ.
+volatile chassis_mode_t chassis_mode = MODE_M1_ASCM_PT;
 
 //overrides
 CAN_FIFOMailBox_TypeDef brake_override;
 volatile int brake_override_ttl = 0;
-int brake_rolling_counter;
+
+// Interceptor-owned rolling counter for 0x315. Applied to every outbound
+// frame on bus 0 regardless of mode, so the counter sequence the EBCM sees
+// stays monotonic across M1/M2/M3 transitions.
+volatile uint8_t synth_315_counter = 0;
 
 // assign CAN numbering
 // bus num: Can bus number on ODB connector. Sent to/from USB
@@ -146,9 +168,10 @@ void process_can(uint8_t can_number) {
           #endif
         }
 
-        // clear interrupt
-        // careful, this can also be cleared by requesting a transmission
-        CAN->TSR |= CAN_TSR_RQCP0;
+        // clear interrupt. TSR is full of W1C bits — write the mask directly
+        // rather than |= so we don't accidentally clear other completion flags
+        // (RQCP1/2, ALST*, TERR*, ...) if they're set.
+        CAN->TSR = CAN_TSR_RQCP0;
       }
 
       if (can_pop(can_queues[bus_number], &to_send)) {
@@ -362,17 +385,54 @@ void can_sce(CAN_TypeDef *CAN) {
   puth(CAN->ESR);
   puts("\n");
 
-  // clear current send
-  CAN->TSR |= CAN_TSR_ABRQ0;
-  CAN->MSR &= ~(CAN_MSR_ERRI);
+  // abort the in-flight send on mailbox 0. ABRQ0 is set-by-software /
+  // reset-by-hardware (reads as 0), so a direct write sets it without
+  // disturbing TSR's W1C status bits (RQCP*/TXOK*/ALST*/TERR*).
+  CAN->TSR = CAN_TSR_ABRQ0;
+  // MSR = MSR clears all set W1C flags (ERRI/WKUI/SLAKI): the read returns
+  // their current values, and writing 1 to a W1C bit clears it.
   CAN->MSR = CAN->MSR;
 
   exit_critical_section();
 }
 
+// Decode the PT interceptor's 0x375 broadcast and refresh pt_status_ttl.
+// Mode is at byte 0 bits 1-2. Value 3 isn't a valid mode (only M1/M2/M3 are
+// encoded) — clamp anything unexpected to M3 so a corrupted frame doesn't
+// accidentally release us from failsafe.
+void handle_update_pt_status(CAN_FIFOMailBox_TypeDef *msg) {
+  uint8_t byte0 = GET_BYTE(msg, 0);
+  uint8_t mode_bits = (byte0 >> 1) & 0x3U;
+  if (mode_bits <= (uint8_t)MODE_M3_NO_PT) {
+    pt_mode = (chassis_mode_t)mode_bits;
+  } else {
+    pt_mode = MODE_M3_NO_PT;
+  }
+  pt_status_ttl = 5;  // ~500 ms grace at TIM3_HZ=10
+}
+
+// Effective chassis mode = pt_mode unless we have a reason to be in failsafe:
+//   - PT broadcast has gone silent (pt_status_ttl decayed to 0)
+//   - Local brake-bound safety flag has latched
+// Runs in TIM3 IRQ. Structuring as a pure derivation lets this collapse
+// cleanly when chassis + PT eventually merge into a single 5-CAN MCU.
+void update_chassis_mode(void) {
+  if ((pt_status_ttl == 0) || brake_max_exceeded) {
+    chassis_mode = MODE_M3_NO_PT;
+  } else {
+    chassis_mode = pt_mode;
+  }
+}
+
+// TIM3 ticks at 10 Hz. APB1 timer clock is 48 MHz on this part, so:
+//   48 MHz / (PSC+1=4800) = 10 kHz counter clock
+//   10 kHz / (ARR+1=1000) = 10 Hz update events
+// Downstream consumers of this rate: status broadcast on 0x376, and the
+// brake_override_ttl decrement.
+#define TIM3_HZ 10
 void ttl_timer_init() {
-  TIM3->PSC = 4800-1;           // Set prescaler to 24 000 (PSC + 1)
-  TIM3->ARR = 1000;               // Auto reload value 1000
+  TIM3->PSC = 4800-1;        // counter clock = 48 MHz / 4800 = 10 kHz
+  TIM3->ARR = 1000-1;        // update event   = 10 kHz / 1000 = 10 Hz
   TIM3->DIER = TIM_DIER_UIE; // Enable update interrupt (timer level)
   TIM3->CR1 = TIM_CR1_CEN;   // Enable timer
 
@@ -386,31 +446,46 @@ void TIM3_IRQHandler(void) {
     if (brake_override_ttl > 0) {
       brake_override_ttl--;
     }
-    exit_critical_section();
-    
-    tick++;
-    if (tick % 1 == 0) {
-      send_interceptor_status();
+    if (pt_status_ttl > 0) {
+      pt_status_ttl--;
     }
+    exit_critical_section();
 
+    update_chassis_mode();
+
+    tick++;
+    send_interceptor_status();
   }
 }
 
+// 0x376 status frame to OBJ. PT interceptor and comma both read this.
+//   byte 0 bit 0  : SystemHealthy (1 = no latched local faults)
+//   byte 0 bit 1  : BrakeExceeded (sticky)
+//   byte 0 bits 2-3: ChassisMode (0=M1, 1=M2, 2=M3)
+//   all other bytes: reserved (0)
 void send_interceptor_status() {
     CAN_FIFOMailBox_TypeDef status;
 
-    uint32_t status_RDLR = STATUS_SYSTEM_HEALTHY;  // System healthy by default
+    // Healthy = no latched faults. Currently brake_max_exceeded is the only
+    // latched fault; AND in any future fault flags here.
+    bool healthy = !brake_max_exceeded;
 
-    // Check fault conditions and update status accordingly
-    if (brake_max_exceeded) {
-	CLEAR_BIT(status_RDLR, STATUS_SYSTEM_HEALTHY);
-	SET_BIT(status_RDLR, STATUS_BRAKE_EXCEEDED);
-    }
+    union {
+        uint8_t bytes[8];
+        struct { uint32_t lo; uint32_t hi; };
+    } data = {{0}};
+
+    const uint8_t SYSTEM_HEALTHY_BIT  = 0;
+    const uint8_t BRAKE_EXCEEDED_BIT  = 1;
+    const uint8_t MODE_SHIFT          = 2;  // 2 bits wide
+    data.bytes[0] = ((healthy ? 1U : 0U)               << SYSTEM_HEALTHY_BIT)
+                  | ((brake_max_exceeded ? 1U : 0U)    << BRAKE_EXCEEDED_BIT)
+                  | (((uint8_t)chassis_mode & 0x3U)    << MODE_SHIFT);
 
     status.RIR = (0x376 << 21) | 1;
     status.RDTR = 8;
-    status.RDLR = status_RDLR;
-    status.RDHR = 0x00000000;
+    status.RDLR = data.lo;
+    status.RDHR = data.hi;
 
     can_push(can_queues[1], &status);
     process_can(CAN_NUM_FROM_BUS_NUM(1));
@@ -425,24 +500,37 @@ void handle_update_brake_override(CAN_FIFOMailBox_TypeDef *override_msg) {
   brake_override_ttl = 5;
 }
 
-bool handle_update_brake_override_rolling_counter(uint32_t rolling_counter) {
-  uint32_t data = brake_override.RDLR & 0xFFFFU;
+// Apply interceptor-owned rolling counter to an in-flight 0x315 frame and
+// recompute the 16-bit checksum. Counter lives at byte 4 bits 0-1; checksum
+// covers (mode << 12 | brake) which is bytes 0-1 (big-endian).
+void rewrite_315_counter(CAN_FIFOMailBox_TypeDef *frame) {
+  uint32_t data = frame->RDLR & 0xFFFFU;
   uint32_t dataswap = (data >> 8) | ((data << 8) & 0xFF00U);
-  uint32_t checksum = (0x10000U - dataswap - rolling_counter) & 0xFFFFU;
+  uint32_t checksum = (0x10000U - dataswap - synth_315_counter) & 0xFFFFU;
   uint32_t checksumswap = (checksum >> 8) | ((checksum << 8) & 0xFF00U);
-  brake_override.RDLR &= 0x0000FFFFU;
-  brake_override.RDLR = brake_override.RDLR | (checksumswap << 16);
-  brake_override.RDHR &= ~0x3U;
-  brake_override.RDHR |= (rolling_counter & 0x3U);
 
-  // BRAKE: safety check
-  int brake = ((GET_BYTE(&brake_override, 0) & 0xFU) << 8) + GET_BYTE(&brake_override, 1);
-  brake = (0x1000 - brake) & 0xFFF;
-  if (brake > GM_MAX_BRAKE) {
-    brake_max_exceeded = true;
-    return false;
-  }
-  return true;
+  // Place checksum into bytes 2-3
+  frame->RDLR = (frame->RDLR & 0x0000FFFFU) | (checksumswap << 16);
+  // Place counter into byte 4 bits 0-1
+  frame->RDHR = (frame->RDHR & ~0x3U) | (synth_315_counter & 0x3U);
+
+  synth_315_counter = (synth_315_counter + 1U) & 0x3U;
+}
+
+// Fill a frame with the synthetic 0x315 failsafe payload: FrictionBrakeMode=0x0
+// (ACC not active), apply_brake=0. We deliberately don't claim "ACC active, no
+// brake" (mode=0x1) — failsafe should tell the EBCM that nothing is in control,
+// not that ACC is alive but idle. Counter and checksum are set by
+// rewrite_315_counter() afterward.
+void fill_synth_315(CAN_FIFOMailBox_TypeDef *frame) {
+  frame->RIR = (0x315 << 21) | 1U;
+  frame->RDTR = 5U;  // DLC = 5
+  // byte 0 = (mode << 4) | (brake_enc bits 8-11) = (0x0 << 4) | 0x0 = 0x00
+  // byte 1 = brake_enc bits 0-7 = 0x00
+  // bytes 2-3 (checksum) set by rewrite_315_counter
+  frame->RDLR = 0x00000000U;
+  // byte 4 (counter) set by rewrite_315_counter; bytes 5-7 unused (DLC=5)
+  frame->RDHR = 0x00000000U;
 }
 
 // ***************************** CAN *****************************
@@ -461,6 +549,10 @@ int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
     if (addr == 0x315) {
       handle_update_brake_override(to_fwd);
     }
+    // PT interceptor status — drives chassis mode
+    if (addr == 0x375) {
+      handle_update_pt_status(to_fwd);
+    }
     return -1;
   }
 
@@ -468,16 +560,33 @@ int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
   if (bus_num == 2) {
     // brake messages
     if (addr == 0x315) {
-	if (brake_override_ttl > 0) {
-          uint32_t curr_rolling_counter = (to_fwd->RDHR & 0x3U);
-	  if (handle_update_brake_override_rolling_counter(curr_rolling_counter)) {
-	    to_fwd->RIR = brake_override.RIR;
-            to_fwd->RDTR = brake_override.RDTR;
-            to_fwd->RDLR = brake_override.RDLR;
-            to_fwd->RDHR = brake_override.RDHR;
-	  }
-	}
-	return 0;
+      // M3 failsafe: emit synthetic "no brake commanded" in place of ASCM frame.
+      // M2 (OP PT): substitute payload with OP's override, subject to safety bound;
+      //             out-of-range requests latch a fault and fall back to synthetic.
+      // M1 (ASCM PT): pass ASCM payload through unchanged.
+      if (chassis_mode == MODE_M3_NO_PT) {
+        fill_synth_315(to_fwd);
+      } else if (chassis_mode == MODE_M2_OP_PT && brake_override_ttl > 0) {
+        int request = ((GET_BYTE(&brake_override, 0) & 0xFU) << 8)
+                    + GET_BYTE(&brake_override, 1);
+        // Decode the signed 12-bit acceleration request before checking bounds.
+        if (request & 0x800) {
+          request -= 0x1000;
+        }
+        if (request < GM_MIN_ACCEL_REQUEST || request > GM_MAX_ACCEL_REQUEST) {
+          brake_max_exceeded = true;
+          fill_synth_315(to_fwd);
+        } else {
+          to_fwd->RIR = brake_override.RIR;
+          to_fwd->RDTR = brake_override.RDTR;
+          to_fwd->RDLR = brake_override.RDLR;
+          to_fwd->RDHR = brake_override.RDHR;
+        }
+      }
+      // Apply interceptor-owned counter on every outbound frame so the sequence
+      // stays monotonic across M1/M2/M3 transitions.
+      rewrite_315_counter(to_fwd);
+      return 0;
     }
     return 0;
   }
