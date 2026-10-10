@@ -28,6 +28,71 @@ uint32_t tick = 0;
 
 bool can_pop(can_ring *q, CAN_FIFOMailBox_TypeDef *elem);
 void send_interceptor_status();
+void ls_mirror(uint8_t bus_number, CAN_FIFOMailBox_TypeDef *frame);
+#define LS_MIRROR 1
+// #define LS_TRANSPARENT 1   // experiment: forward everything car->ASCM (bypasses the whitelist)
+
+// ---------------------------------------------------------------------------
+// SW GMLAN high-voltage wake-up state machine (ASCM side, bus 2 / CAN3).
+// A wake-up = mode pins to HV, one 0x100 DLC-0 frame, mode pins back to
+// normal as soon as the frame completes (TX-complete IRQ) or 8 ms elapse
+// (aborted). Requests are coalesced: boot, retries while the ASCM is silent,
+// and any relayed car-side 0x100 all go through request_wakeup().
+// ---------------------------------------------------------------------------
+typedef enum { WAKE_IDLE = 0, WAKE_HV = 1 } wake_state_t;
+volatile wake_state_t wake_state = WAKE_IDLE;
+volatile bool wake_pending = false;
+volatile uint32_t wake_hv_start_us = 0;      // TIM2 (1 MHz) at HV entry
+volatile uint32_t wake_last_hv_us = 0;       // duration of the last HV episode
+volatile uint8_t  wake_attempts = 0;         // this boot, saturating
+volatile uint8_t  wake_episode_attempts = 0; // since the ASCM was last heard
+volatile bool     wake_hv_entered_sticky = false;  // set on HV entry, cleared by status
+volatile bool     wake_guard_tripped = false;      // HV held > 100 ms, forced normal
+volatile uint32_t wake_last_attempt_tick = 0;      // in 100 ms status ticks
+volatile uint32_t wake_bus2_bad_tick = 0;          // last status tick with EP/bus-off
+volatile uint32_t status_tick = 0;                 // 100 ms status ticks since boot
+
+#define WAKE_HV_TIMEOUT_US    8000U
+#define WAKE_HV_GUARD_US    100000U
+#define WAKE_SETTLE_LOOPS     4000   // ~0.3 ms transceiver mode settle
+
+static inline bool sw_gmlan_pins_in_hv(void) {
+  return ((GPIOB->ODR & (1U << 15)) == 0U);   // mode0 low, mode1 high
+}
+
+void request_wakeup(void) {
+  if (wake_state == WAKE_IDLE) {
+    wake_pending = true;
+  }
+}
+
+// Leave HV mode. Called from the TX-complete path (ok = TXOK) or a timeout.
+void wake_finish(bool ok) {
+  (void)ok;
+  set_sw_gmlan_normal();
+  wake_last_hv_us = TIM2->CNT - wake_hv_start_us;
+  wake_state = WAKE_IDLE;
+}
+
+// Called from TIM3 (every 5 ms): timeout and hard guard on the mode pins.
+void wake_supervise(void) {
+  enter_critical_section();
+  if (wake_state == WAKE_HV) {
+    if ((TIM2->CNT - wake_hv_start_us) > WAKE_HV_TIMEOUT_US) {
+      CAN3->TSR |= CAN_TSR_ABRQ0;   // stop retransmitting at normal voltage
+      wake_finish(false);
+    }
+  }
+  if (sw_gmlan_pins_in_hv() &&
+      ((wake_state != WAKE_HV) || ((TIM2->CNT - wake_hv_start_us) > WAKE_HV_GUARD_US))) {
+    set_sw_gmlan_normal();
+    CAN3->TSR |= CAN_TSR_ABRQ0;
+    wake_state = WAKE_IDLE;
+    wake_pending = false;
+    wake_guard_tripped = true;
+  }
+  exit_critical_section();
+}
 
 // assign CAN numbering
 // bus num: Can bus number on ODB connector. Sent to/from USB
@@ -130,40 +195,59 @@ void process_can(uint8_t can_number) {
           #endif
         }
 
+        if ((bus_number == 2) && (wake_state == WAKE_HV)) {
+          wake_finish((CAN->TSR & CAN_TSR_TXOK0) == CAN_TSR_TXOK0);
+        }
+
         // clear interrupt
         // careful, this can also be cleared by requesting a transmission
         CAN->TSR |= CAN_TSR_RQCP0;
       }
 
-      if (can_pop(can_queues[bus_number], &to_send)) {
-	if ( bus_number == 2 && GET_ADDR(&to_send) == 0x100) {
-	  puts("\nsetting hv wakeup\n");
-	  set_sw_gmlan_hv_wakeup();
-	  delay(43668); // Sleep for about 40ms
-	}
+      bool start_wake = (bus_number == 2) && (wake_state == WAKE_IDLE) && wake_pending;
 
-        // only send if we have received a packet
-        CAN->sTxMailBox[0].TDLR = to_send.RDLR;
-        CAN->sTxMailBox[0].TDHR = to_send.RDHR;
-        CAN->sTxMailBox[0].TDTR = to_send.RDTR;
-        CAN->sTxMailBox[0].TIR = to_send.RIR;
+      if (!start_wake && can_pop(can_queues[bus_number], &to_send)) {
+        if ((bus_number == 2) && (GET_ADDR(&to_send) == 0x100)) {
+          // relayed car-side HV wake-up: never send it as a plain frame,
+          // fold it into the state machine instead
+          request_wakeup();
+          start_wake = (wake_state == WAKE_IDLE) && wake_pending;
+        } else {
+          // only send if we have received a packet
+          CAN->sTxMailBox[0].TDLR = to_send.RDLR;
+          CAN->sTxMailBox[0].TDHR = to_send.RDHR;
+          CAN->sTxMailBox[0].TDTR = to_send.RDTR;
+          CAN->sTxMailBox[0].TIR = to_send.RIR;
 
-	if ( bus_number == 2 && GET_ADDR(&to_send) == 0x100) {
-	  delay(45459); // Sleep for about 5ms
-	  puts("\nsetting normal mode\n");
-	  set_sw_gmlan_normal();
-	  delay(43668); // Sleep for about 40ms
-	}
+          if (can_number == 0) {
+            can0_tx_cnt++;
+          }
+          if (can_number == 1) {
+            can1_tx_cnt++;
+          }
+          if (can_number == 2) {
+            can2_tx_cnt++;
+          }
+        }
+      }
 
-	if (can_number == 0) {
-          can0_tx_cnt++;
-        }
-        if (can_number == 1) {
-          can1_tx_cnt++;
-        }
-        if (can_number == 2) {
-          can2_tx_cnt++;
-        }
+      if (start_wake) {
+        // HV wake-up pulse: mode pins to HV, settle, one 0x100 frame.
+        // Mode pins return to normal in wake_finish() on TX complete/timeout.
+        wake_pending = false;
+        wake_state = WAKE_HV;
+        wake_hv_entered_sticky = true;
+        if (wake_attempts < 255U) wake_attempts++;
+        if (wake_episode_attempts < 255U) wake_episode_attempts++;
+        wake_last_attempt_tick = status_tick;
+        set_sw_gmlan_hv_wakeup();
+        delay(WAKE_SETTLE_LOOPS);
+        wake_hv_start_us = TIM2->CNT;
+        CAN->sTxMailBox[0].TDLR = 0;
+        CAN->sTxMailBox[0].TDHR = 0;
+        CAN->sTxMailBox[0].TDTR = 0;
+        CAN->sTxMailBox[0].TIR = (0x100U << 21) | 1U;
+        can2_tx_cnt++;
       }
     }
 
@@ -336,7 +420,7 @@ void can_sce(CAN_TypeDef *CAN) {
 
 void ttl_timer_init() {
   TIM3->PSC = 4800-1;	        // Set prescaler to 24 000 (PSC + 1)
-  TIM3->ARR = 200-1;	          // Auto reload value 1000
+  TIM3->ARR = 50-1;             // 10 kHz / 50 = 200 Hz (5 ms) supervision tick
   TIM3->DIER = TIM_DIER_UIE; // Enable update interrupt (timer level)
   TIM3->CR1 = TIM_CR1_CEN;   // Enable timer
 
@@ -348,7 +432,8 @@ void TIM3_IRQHandler(void)
 if (TIM3->SR & TIM_SR_UIF) // if UIF flag is set
   {
     TIM3->SR &= ~TIM_SR_UIF; // clear UIF flag
-    if (tick % 5 == 0) {
+    wake_supervise();
+    if (tick % 20 == 0) {         // 10 Hz status
         send_interceptor_status();
     }
     tick++;
@@ -362,9 +447,32 @@ int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
 
   // SW GMLAN
   if (bus_num == 0) {
+#ifdef LS_TRANSPARENT
+    // Experiment: forward everything from the car LS bus to the ASCM.
+    // 0x100 (HV wake-up) is sent in HV mode by process_can on bus 2.
+    return 2;
+#endif
     if (can2_rx_cnt == 0) {
       return -1;
     }
+
+    // Whitelist v2 (2026-09-12): diagnostics must reach the ASCM. GM tools address
+    // its "Frontview Camera Module" identity at 0x24B over this bus, and use the
+    // all-nodes functional request 0x101 for sessions, tester-present and clears.
+    if (addr == 0x101) { return 2; }                       // GMLAN all-nodes functional request
+    if (addr == 0x7DF) { return 2; }                       // OBD functional request
+    if ((addr >= 0x240) && (addr <= 0x25F)) { return 2; }  // GMLAN physical requests (0x24B = ASCM/FCM2)
+    if (addr == 0x100) { return 2; }                       // car HV wake-up: relayed through the wake-up state machine
+
+    // Whitelist v3 (2026-09-12): network management must reach the ASCM. The
+    // mirror logs show the ASCM re-announces its LS messages (incl. the LKA
+    // icon frame the cluster supervises) only when it receives virtual-network
+    // activity from the car; with v1 it announced once at boot and went quiet,
+    // and the cluster logged "lost communication with Frontview Camera Module".
+    if ((addr & 0xFFFFFF00) == 0x13FFE000) { return 2; }  // network-management frame, any node
+    if ((addr & 0xFFFF0000) == 0x10300000) { return 2; }  // 0x1030xxxx family (a3 22 01 payloads, ~2.6 Hz per node)
+    if ((addr > 0x7FF) && ((addr & 0xFF) == 0x60)) { return 2; }  // anything sourced by the instrument cluster
+
     //puts("addr: ");
     //puth(addr);
     //puts(" end\n");
@@ -729,24 +837,175 @@ int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
   return -1;
 }
 
+// ---------------------------------------------------------------------------
+// LS mirroring onto the OBJ bus (bus 1), for logging only. Each LS frame
+// becomes two 11-bit frames on OBJ:
+//   ASCM side (bus 2 RX): header 0x3F8, data 0x3F9
+//   car side  (bus 0 RX): header 0x3FA, data 0x3FB
+//   header: bytes 0-3 = CAN ID little-endian (bit 31 set when 29-bit),
+//           byte 4 = DLC, byte 5 = sequence, bytes 6-7 = 0
+//   data:   the original 8 data bytes (RDLR, RDHR)
+// The two frames share the sequence byte; the data frame follows the header.
+// Nothing on the object bus listens to 0x3F8-0x3FB.
+// ---------------------------------------------------------------------------
+uint8_t ls_mirror_seq[3] = {0, 0, 0};
+
+void ls_mirror(uint8_t bus_number, CAN_FIFOMailBox_TypeDef *frame) {
+  CAN_FIFOMailBox_TypeDef hdr;
+  CAN_FIFOMailBox_TypeDef dat;
+  uint32_t rir = frame->RIR;
+  uint32_t id = ((rir & 4U) != 0U) ? ((rir >> 3) | 0x80000000U) : (rir >> 21);
+  uint8_t seq = ls_mirror_seq[bus_number]++;
+  uint32_t base = (bus_number == 2U) ? 0x3F8U : 0x3FAU;
+
+  hdr.RIR = (base << 21) | 1U;
+  hdr.RDTR = 8;
+  hdr.RDLR = id;
+  hdr.RDHR = (uint32_t)(frame->RDTR & 0xFU) | ((uint32_t)seq << 8);
+
+  dat.RIR = ((base + 1U) << 21) | 1U;
+  dat.RDTR = 8;
+  dat.RDLR = frame->RDLR;
+  dat.RDHR = frame->RDHR;
+
+  can_push(can_queues[1], &hdr);
+  can_push(can_queues[1], &dat);
+  process_can(CAN_NUM_FROM_BUS_NUM(1));
+}
+
+// ---------------------------------------------------------------------------
+// 0x377 (887) debug status, 10 Hz on OBJ (bus 1). Nothing reads this frame;
+// it exists so every comma drive log carries the proxy's health.
+//
+//   byte 0  flags
+//     bit 0  at least one HV wake-up attempted this boot
+//     bit 1  ASCM LS side alive: frame received on bus 2 within the last 1 s
+//     bit 2  car LS side alive: frame received on bus 0 within the last 1 s
+//     bit 3  forwarding gate open (ASCM has transmitted at least once)
+//     bit 4  transceiver mode pins in HV mode right now (sampled)
+//     bit 5  wake-up in progress (HV pulse active or requested)
+//     bit 6  HV mode was entered since the previous status frame (sticky)
+//     bit 7  bus 2 bus-off (bxCAN ESR.BOFF)
+//   byte 1  frames received from the ASCM (bus 2 RX) in the last 100 ms, saturating
+//   byte 2  frames received from the car LS bus (bus 0 RX) in the last 100 ms, saturating
+//   byte 3  frames forwarded to the ASCM (bus 2 TX) in the last 100 ms, saturating
+//   byte 4  bus 2 transmit error counter (ESR.TEC)
+//   byte 5  duration of the last HV episode, ms, saturating at 255
+//   byte 6  bits 0-2 bus 2 last error code (ESR.LEC), bit 3 bus 2 error-passive,
+//           bits 4-6 HV pulses this boot, boot + retries + relayed (saturating at 7), bit 7 HV guard tripped
+//   byte 7  seconds since the last frame from the ASCM, saturating at 255 (255 = never)
+// ---------------------------------------------------------------------------
+uint32_t status_last_rx0 = 0;
+uint32_t status_last_rx2 = 0;
+uint32_t status_last_tx2 = 0;
+uint32_t status_ticks_since_rx0 = 0xFFFFFFFFU;  // 100 ms units
+uint32_t status_ticks_since_rx2 = 0xFFFFFFFFU;  // 100 ms units
+
+static uint8_t sat8(uint32_t v) {
+  return (v > 255U) ? 255U : (uint8_t)v;
+}
+
+// Retry policy, evaluated every 100 ms:
+//   - only while the car LS bus is active and bus 2 is not error-passive/bus-off
+//     (and has been clean for 2 s)
+//   - ASCM never heard, or silent >= 1 s during a wake episode: retry every 1 s
+//     for the first 5 attempts, then every 5 s
+//   - ASCM previously alive and now silent >= 3 s: start a new episode
+void wake_retry_policy(void) {
+  bool car_active = (status_ticks_since_rx0 < 10U);
+  bool never_heard = (status_ticks_since_rx2 == 0xFFFFFFFFU);
+  uint32_t esr2 = CAN3->ESR;
+  bool bus2_bad = ((esr2 & (CAN_ESR_BOFF | CAN_ESR_EPVF)) != 0U);
+
+  if (status_ticks_since_rx2 == 0U) {
+    wake_episode_attempts = 0;
+  }
+  if (bus2_bad) {
+    wake_bus2_bad_tick = status_tick;
+    return;
+  }
+  if ((status_tick - wake_bus2_bad_tick) < 20U) {
+    return;   // 2 s quiet after an error state
+  }
+  if (!car_active || (wake_state != WAKE_IDLE) || wake_pending) {
+    return;
+  }
+  uint32_t silent_needed = (never_heard || (wake_episode_attempts > 0U)) ? 10U : 30U;
+  if (status_ticks_since_rx2 < silent_needed) {
+    return;
+  }
+  uint32_t interval = (wake_episode_attempts < 5U) ? 10U : 50U;
+  if ((status_tick - wake_last_attempt_tick) >= interval) {
+    request_wakeup();
+    process_can(CAN_NUM_FROM_BUS_NUM(2));
+  }
+}
+
 void send_interceptor_status() {
     CAN_FIFOMailBox_TypeDef status;
 
-    // Send HV wakeup on boot
+    // First HV wake-up right at boot
     if (tick == 0) {
-      status.RIR = (0x100 << 21) | 1;
-      status.RDTR = 0;
-      status.RDLR = 0;
-      status.RDHR = 0;
-
-      can_push(can_queues[2], &status);
+      request_wakeup();
       process_can(CAN_NUM_FROM_BUS_NUM(2));
     }
 
+    // --- activity since the previous status tick (100 ms) ---
+    uint32_t rx0 = (uint32_t)can0_rx_cnt;
+    uint32_t rx2 = (uint32_t)can2_rx_cnt;
+    uint32_t tx2 = (uint32_t)can2_tx_cnt;
+    uint32_t d_rx0 = rx0 - status_last_rx0;
+    uint32_t d_rx2 = rx2 - status_last_rx2;
+    uint32_t d_tx2 = tx2 - status_last_tx2;
+    status_last_rx0 = rx0;
+    status_last_rx2 = rx2;
+    status_last_tx2 = tx2;
+
+    if (d_rx0 != 0U) {
+      status_ticks_since_rx0 = 0U;
+    } else if (status_ticks_since_rx0 != 0xFFFFFFFFU) {
+      status_ticks_since_rx0++;
+    }
+    if (d_rx2 != 0U) {
+      status_ticks_since_rx2 = 0U;
+    } else if (status_ticks_since_rx2 != 0xFFFFFFFFU) {
+      status_ticks_since_rx2++;
+    }
+
+    status_tick++;
+    wake_retry_policy();
+
+    uint32_t esr2 = CAN3->ESR;
+
+    union {
+        uint8_t bytes[8];
+        struct { uint32_t lo; uint32_t hi; };
+    } data = {{0}};
+
+    data.bytes[0] = ((wake_attempts > 0U) ? 1U : 0U)
+                  | ((status_ticks_since_rx2 < 10U) ? 1U : 0U) << 1
+                  | ((status_ticks_since_rx0 < 10U) ? 1U : 0U) << 2
+                  | ((can2_rx_cnt > 0) ? 1U : 0U) << 3
+                  | (sw_gmlan_pins_in_hv() ? 1U : 0U) << 4
+                  | (((wake_state == WAKE_HV) || wake_pending) ? 1U : 0U) << 5
+                  | (wake_hv_entered_sticky ? 1U : 0U) << 6
+                  | (((esr2 >> 2) & 0x1U) << 7);
+    wake_hv_entered_sticky = false;
+    data.bytes[1] = sat8(d_rx2);
+    data.bytes[2] = sat8(d_rx0);
+    data.bytes[3] = sat8(d_tx2);
+    data.bytes[4] = (uint8_t)((esr2 >> 16) & 0xFFU);
+    data.bytes[5] = sat8((wake_last_hv_us + 500U) / 1000U);
+    data.bytes[6] = (uint8_t)(((esr2 >> 4) & 0x7U)
+                  | (((esr2 >> 1) & 0x1U) << 3)
+                  | (((wake_attempts > 7U) ? 7U : wake_attempts) << 4)
+                  | ((wake_guard_tripped ? 1U : 0U) << 7));
+    data.bytes[7] = (status_ticks_since_rx2 == 0xFFFFFFFFU) ? 255U : sat8(status_ticks_since_rx2 / 10U);
+
     status.RIR = (887 << 21) | 1;
     status.RDTR = 8;
-    status.RDLR = 0x01020304;
-    status.RDHR = 0x05060708;
+    status.RDLR = data.lo;
+    status.RDHR = data.hi;
     can_push(can_queues[1], &status);
     process_can(CAN_NUM_FROM_BUS_NUM(1));
 
@@ -757,15 +1016,6 @@ void send_interceptor_status() {
       stay_awake.RDLR = 0x00004000; 
       stay_awake.RDHR = 0x00000000;
 
-      puts("generated stay awake: RIR:");
-      puth(stay_awake.RIR);
-      puts(" RDTR: ");
-      puth(stay_awake.RDTR);
-      puts(" RDLR: ");
-      puth(stay_awake.RDLR);
-      puts(" RDHR: ");
-      puth(stay_awake.RDHR);
-      puts("\n");
       can_push(can_queues[2], &stay_awake);
       process_can(CAN_NUM_FROM_BUS_NUM(2));
     }
@@ -803,6 +1053,13 @@ void can_rx(uint8_t can_number) {
       can_push(can_queues[bus_fwd_num], &to_tx);
       process_can(CAN_NUM_FROM_BUS_NUM(bus_fwd_num));
     }
+
+#ifdef LS_MIRROR
+    // Mirror every LS frame onto the OBJ bus so the comma logs it.
+    if ((bus_number == 0) || (bus_number == 2)) {
+      ls_mirror(bus_number, &to_tx);
+    }
+#endif
 
     // next
     CAN->RF0R |= CAN_RF0R_RFOM0;
