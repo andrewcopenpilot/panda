@@ -205,6 +205,25 @@ int can2_tx_cnt = 0;
 uint32_t tick = 0;
 volatile uint8_t ascm_acc_cmd_active = 0;
 
+// Chassis interceptor health, decoded from its 0x376 status broadcasts on OBJ.
+// Defaults to "not healthy / silent" so we start in M3 until chassis confirms
+// healthy after boot. The first valid 0x376 frame normally releases us within
+// ~100 ms.
+volatile bool chassis_healthy = false;
+volatile int chassis_status_ttl = 0;
+
+// True once any frame has been received from the ASCM (bus 2) this power
+// cycle. M3 synthetic emission is gated on it so the interceptor never puts
+// ASCM message IDs on the powertrain bus before the real ASCM exists: at
+// key-on the bus stays silent until the ASCM boots, exactly like a stock car.
+// (Before this gate the unit transmitted synthetic 0x370/0x2CB/0x180 ~0.5 s
+// ahead of the ASCM, then went silent when it dropped to M1, and modules
+// supervising those IDs logged lost-communication codes every key cycle.)
+volatile bool ascm_seen = false;
+// Gap-level bits (byte 2 bits 5-4) of the last real ASCM 0x370, mirrored into
+// the synthetic frame so the cluster's gap setting does not flicker in M3.
+volatile uint8_t ascm_370_gap_bits = 0x20;
+
 void can_send(CAN_FIFOMailBox_TypeDef *to_push, uint8_t bus_number);
 bool can_pop(can_ring *q, CAN_FIFOMailBox_TypeDef *elem);
 void send_interceptor_status();
@@ -214,6 +233,7 @@ void emit_synth_370(void);
 void emit_synth_2cb(void);
 void emit_synth_1e1(uint8_t acc_buttons);
 void rewrite_2cb_counter(CAN_FIFOMailBox_TypeDef *frame);
+void handle_update_chassis_status(CAN_FIFOMailBox_TypeDef *msg);
 
 // Interceptor operating modes:
 //   M1 (ASCM PT)  — ASCM has priority. OEM cruise drives the car if engaged.
@@ -598,14 +618,19 @@ void update_interceptor_mode(void) {
   bool op_engaged = (acc_status_ttl > 0) &&
                     (((acc_status_override.RDLR >> 23) & 1U) != 0U);
   bool ascm_engaged = (ascm_acc_cmd_active != 0U);
+  // Force M3 if chassis interceptor is unhealthy or has gone silent.
+  // Boot: chassis_status_ttl=0 so we start in M3 until the first 0x376
+  // arrives — typically within ~100 ms of chassis boot.
+  bool chassis_force_m3 = (chassis_status_ttl == 0) || !chassis_healthy;
 
   if (interceptor_mode == MODE_M3_NO_PT) {
-    if (!op_engaged && !ascm_engaged) {
+    // M3 exit requires both engagement signals off AND chassis healthy.
+    if (!op_engaged && !ascm_engaged && !chassis_force_m3) {
       interceptor_mode = MODE_M1_ASCM_PT;
     }
-    // else: stay in M3 until both sides confirm disengaged
+    // else: stay in M3
   } else {
-    if (op_engaged && ascm_engaged) {
+    if (chassis_force_m3 || (op_engaged && ascm_engaged)) {
       interceptor_mode = MODE_M3_NO_PT;
     } else if (op_engaged) {
       interceptor_mode = MODE_M2_OP_PT;
@@ -648,6 +673,9 @@ if (TIM3->SR & TIM_SR_UIF) // if UIF flag is set
     if (acc_status_ttl > 0) {
         acc_status_ttl--;
     }
+    if (chassis_status_ttl > 0) {
+        chassis_status_ttl--;
+    }
     exit_critical_section();
 
     update_interceptor_mode();
@@ -657,7 +685,8 @@ if (TIM3->SR & TIM_SR_UIF) // if UIF flag is set
         send_interceptor_status();
     }
     // M3 synthetic emission at 25 Hz (every other 50 Hz TIM3 tick).
-    if ((interceptor_mode == MODE_M3_NO_PT) && ((tick % 2U) == 0U)) {
+    // Only once the real ASCM has been seen this power cycle (see ascm_seen).
+    if ((interceptor_mode == MODE_M3_NO_PT) && ascm_seen && ((tick % 2U) == 0U)) {
         emit_synth_370();
         emit_synth_2cb();
     }
@@ -683,6 +712,8 @@ void emit_synth_370(void) {
     for (uint8_t i = 0; i < 6U; i++) {
         data.bytes[i] = SYNTH_370_PAYLOAD[i];
     }
+    // byte 2 bits 5-4 = ACCGapLevel: mirror the last real ASCM value
+    data.bytes[2] = (uint8_t)((data.bytes[2] & 0xCFU) | (ascm_370_gap_bits & 0x30U));
 
     frame.RIR = (0x370 << 21) | 1U;  // standard ID, TXRQ
     frame.RDTR = 6U;                  // DLC = 6
@@ -826,7 +857,7 @@ void send_steering_msg(uint32_t tick) {
         steer.RDTR = steering_oem.RDTR;
         steer.RDLR = steering_oem.RDLR;
         steer.RDHR = steering_oem.RDHR;
-    } else if (interceptor_mode == MODE_M3_NO_PT
+    } else if ((interceptor_mode == MODE_M3_NO_PT && ascm_seen)
                || (interceptor_mode == MODE_M2_OP_PT && steering_override_ttl == 0)) {
         // synthetic: zeroed payload -> torque=0, active=0
         steer.RDTR = 4;  // DLC = 4
@@ -952,6 +983,13 @@ void handle_update_acc_status_override(CAN_FIFOMailBox_TypeDef *override_msg) {
   acc_status_ttl = 50;
 }
 
+// Decode the chassis interceptor's 0x376 broadcast and refresh chassis_status_ttl.
+// Byte 0 bit 0 = SystemHealthy (1 = no latched local faults).
+void handle_update_chassis_status(CAN_FIFOMailBox_TypeDef *msg) {
+  chassis_healthy = ((GET_BYTE(msg, 0) & 0x1U) != 0U);
+  chassis_status_ttl = 50;  // 1 second grace at TIM3_HZ=50
+}
+
 int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
   uint32_t addr = to_fwd->RIR>>21;
   
@@ -986,11 +1024,16 @@ int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
     if (addr == 0x370) {
       handle_update_acc_status_override(to_fwd);
     }
+    // 0x376 == chassis interceptor status — drives chassis_healthy and TTL
+    if (addr == 0x376) {
+      handle_update_chassis_status(to_fwd);
+    }
     return -1;
   }
 
   // ASCM to CAR
   if (bus_num == 2) {
+    ascm_seen = true;
     // 0x180 == lkasteeringcmd : Only update, steering is more complex because it cycles between 10 Hz and 50 Hz
     // so this interceptor needs to be the heartbeat
     if (addr == 0x180) {
@@ -1035,6 +1078,7 @@ int fwd_filter(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
       // releasing into M1/M2 only to have ASCM resume and dump that into
       // the powertrain bus.
       ascm_acc_cmd_active = (to_fwd->RDLR >> 23) & 1U;
+      ascm_370_gap_bits = (uint8_t)((to_fwd->RDLR >> 16) & 0x30U);
       // In M3, synthetic emission owns bus 0 for this address; suppress fwd.
       if (interceptor_mode == MODE_M3_NO_PT) {
         return -1;
